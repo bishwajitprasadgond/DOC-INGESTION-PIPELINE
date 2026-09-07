@@ -1,0 +1,32 @@
+[llm]
+id = "gemma_4_31b"
+name = "Gemma-4 31B (vLLM)"
+base_url = "http://10.190.236.15:9000/api/v1"
+api_key = "sk-5f113ba3077849f3bfbb8b5214343c7b"
+model_name = "google/gemma-4-31b-it"
+max_tokens = 1024
+temperature = 0.2
+timeout = 60.0
+
+[chunking]
+chunk_max_chars = 3000
+questions_per_chunk = 3
+metadata_sample_chars = 4000
+
+[embeddings]
+model_name = "sentence-transformers/all-MiniLM-L6-v2"
+dimension = 384
+device = "cpu"
+
+[elasticsearch]
+enabled = false
+host = "https://localhost:9200"
+api_key = ""
+index_name = "docs-qa"
+index_mode = "create"
+fields = ["Document-id", "Document-type", "Document-url", "Ingestion-date", "Title", "Keywords", "Category", "Sub-category", "Serial-no", "Question", "Solutions"]
+request_timeout = 30
+max_retries = 3
+retry_on_timeout = true
+verify_certs = true
+connections_per_node = 10

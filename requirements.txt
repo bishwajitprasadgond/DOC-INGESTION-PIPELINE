@@ -1,0 +1,12 @@
+langchain-openai
+langchain-core
+openai
+python-docx
+openpyxl
+fastapi
+uvicorn
+elasticsearch
+sentence-transformers
+requests
+pandas
+jupyter
