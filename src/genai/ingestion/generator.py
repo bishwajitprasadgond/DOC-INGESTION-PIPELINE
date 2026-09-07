@@ -1,59 +1,15 @@
 import json
 
-from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
+from ..prompt.loader import load_prompts
 from ..utils.llm_client import invoke_json
 
-METADATA_PROMPT = PromptTemplate.from_template("""You are analyzing a business document to catalog it.
-Read the excerpt below and respond with ONLY a JSON object (no markdown fences) in this exact shape:
-{{"title": "<short descriptive title>", "keywords": ["<keyword1>", "<keyword2>", "..."], "category": "<broad category>", "sub_category": "<more specific sub-category>"}}
-
-Rules:
-- "title" should be a concise, human-readable title for the document (max ~12 words).
-- "keywords" should be 3 to 8 relevant single/short-phrase keywords.
-- "category" and "sub_category" should classify the document's subject matter (e.g. category "Finance", sub_category "Invoicing").
-
-Document excerpt:
-\"\"\"
-{text}
-\"\"\"
-""")
-
-CATEGORY_PROMPT = PromptTemplate.from_template("""You are cataloging a single question-and-answer pair taken from a document.
-Respond with ONLY a JSON object (no markdown fences) in this exact shape:
-{{"category": "<broad category>", "sub_category": "<more specific sub-category>"}}
-
-Question: {question}
-Answer: {answer}
-""")
-
-HEADER_MAP_PROMPT = PromptTemplate.from_template("""You are analyzing the header row of a table extracted from a document, to figure out which column (if any) holds which kind of data.
-Header columns (0-indexed): {headers}
-
-Respond with ONLY a JSON object (no markdown fences) in this exact shape, using the 0-indexed column position or null if that kind of column is not present:
-{{"question_col": <int|null>, "answer_col": <int|null>, "category_col": <int|null>, "sub_category_col": <int|null>, "serial_col": <int|null>}}
-
-Rules:
-- "question_col" is the column holding quiz/exam questions.
-- "answer_col" is the column holding the answer/response/solution to that question.
-- "category_col" / "sub_category_col" classify the subject matter of the row.
-- "serial_col" is a row serial/sequence number (e.g. "Sr. No", "S.No", "#").
-- Only set a field if you are confident that kind of column is actually present; otherwise use null.
-""")
-
-QA_PROMPT = PromptTemplate.from_template("""You are an expert quiz writer creating study questions strictly from the provided document section.
-Section title: {section}
-
-Generate exactly {n} question-and-answer pairs grounded ONLY in the text below. Do not invent facts not present in the text.
-Respond with ONLY a JSON object (no markdown fences) in this exact shape:
-{{"qa_pairs": [{{"question": "<question text>", "answer": "<answer text>"}}, ...]}}
-
-Text:
-\"\"\"
-{text}
-\"\"\"
-""")
+_prompts = load_prompts()
+METADATA_PROMPT = _prompts["metadata"]
+CATEGORY_PROMPT = _prompts["category"]
+HEADER_MAP_PROMPT = _prompts["header_map"]
+QA_PROMPT = _prompts["qa"]
 
 
 def generate_doc_metadata(chat_model: ChatOpenAI, doc_text_sample: str) -> dict:
