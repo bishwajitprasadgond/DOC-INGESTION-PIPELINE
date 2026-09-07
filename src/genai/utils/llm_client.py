@@ -1,11 +1,10 @@
-import json
-import re
-
+from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 
 from ...config import settings
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_json_parser = JsonOutputParser()
 
 
 def get_chat_model() -> ChatOpenAI:
@@ -20,31 +19,19 @@ def get_chat_model() -> ChatOpenAI:
     )
 
 
-def _clean_json_text(raw: str) -> str:
-    text = raw.strip()
-    text = _CODE_FENCE_RE.sub("", text).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
-    return text
-
-
 def invoke_json(chat_model: ChatOpenAI, prompt: str, retries: int = 2) -> dict:
-    last_error: Exception | None = None
+    chain = chat_model | _json_parser
     messages = [{"role": "user", "content": prompt}]
+    last_error: Exception | None = None
 
     for attempt in range(retries + 1):
-        response = chat_model.invoke(messages)
-        raw = response.content if isinstance(response.content, str) else str(response.content)
-        cleaned = _clean_json_text(raw)
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as exc:
+            return chain.invoke(messages)
+        except OutputParserException as exc:
             last_error = exc
             messages = [
                 {"role": "user", "content": prompt},
-                {"role": "assistant", "content": raw},
+                {"role": "assistant", "content": exc.llm_output or ""},
                 {
                     "role": "user",
                     "content": (

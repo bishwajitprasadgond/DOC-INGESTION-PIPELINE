@@ -1,10 +1,11 @@
 import json
 
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
 from ..utils.llm_client import invoke_json
 
-METADATA_PROMPT = """You are analyzing a business document to catalog it.
+METADATA_PROMPT = PromptTemplate.from_template("""You are analyzing a business document to catalog it.
 Read the excerpt below and respond with ONLY a JSON object (no markdown fences) in this exact shape:
 {{"title": "<short descriptive title>", "keywords": ["<keyword1>", "<keyword2>", "..."], "category": "<broad category>", "sub_category": "<more specific sub-category>"}}
 
@@ -17,17 +18,17 @@ Document excerpt:
 \"\"\"
 {text}
 \"\"\"
-"""
+""")
 
-CATEGORY_PROMPT = """You are cataloging a single question-and-answer pair taken from a document.
+CATEGORY_PROMPT = PromptTemplate.from_template("""You are cataloging a single question-and-answer pair taken from a document.
 Respond with ONLY a JSON object (no markdown fences) in this exact shape:
 {{"category": "<broad category>", "sub_category": "<more specific sub-category>"}}
 
 Question: {question}
 Answer: {answer}
-"""
+""")
 
-HEADER_MAP_PROMPT = """You are analyzing the header row of a table extracted from a document, to figure out which column (if any) holds which kind of data.
+HEADER_MAP_PROMPT = PromptTemplate.from_template("""You are analyzing the header row of a table extracted from a document, to figure out which column (if any) holds which kind of data.
 Header columns (0-indexed): {headers}
 
 Respond with ONLY a JSON object (no markdown fences) in this exact shape, using the 0-indexed column position or null if that kind of column is not present:
@@ -39,9 +40,9 @@ Rules:
 - "category_col" / "sub_category_col" classify the subject matter of the row.
 - "serial_col" is a row serial/sequence number (e.g. "Sr. No", "S.No", "#").
 - Only set a field if you are confident that kind of column is actually present; otherwise use null.
-"""
+""")
 
-QA_PROMPT = """You are an expert quiz writer creating study questions strictly from the provided document section.
+QA_PROMPT = PromptTemplate.from_template("""You are an expert quiz writer creating study questions strictly from the provided document section.
 Section title: {section}
 
 Generate exactly {n} question-and-answer pairs grounded ONLY in the text below. Do not invent facts not present in the text.
@@ -52,7 +53,7 @@ Text:
 \"\"\"
 {text}
 \"\"\"
-"""
+""")
 
 
 def generate_doc_metadata(chat_model: ChatOpenAI, doc_text_sample: str) -> dict:
