@@ -329,7 +329,11 @@ Then open `http://localhost:8080`. From the page you can:
 - Click **Run ingestion** to run the pipeline (off the UI thread) and see the
   resulting summary, with a download button for the CSV when that's the sink.
 
-Runs on port `8080`, separate from the API's `8000`, so both can run at once.
+Runs on port `8080` by default (or `$CDSW_APP_PORT` when set, for hosting on
+Cloudera CDSW/CML), separate from the API's `8000`, so both can run at once.
+On startup it retries the configured LLM endpoint up to 3 times (logged to
+`logs/ingestion.log`) and starts the UI regardless of the outcome — a slow or
+unreachable backend never blocks the page from loading.
 
 ### Interactive notebook
 
