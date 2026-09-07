@@ -1,11 +1,14 @@
 from pathlib import Path
 from typing import Literal, Optional
 
-import config
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, model_validator
 
-from pipeline import run_pipeline
+from ..config import settings
+from .ingestion.pipeline import run_pipeline
+from .utils.logging_config import setup_logging
+
+setup_logging(settings.logging)
 
 app = FastAPI(title="Doc Q&A Ingestion API")
 
@@ -44,7 +47,7 @@ def health() -> dict:
 def generate(request: GenerateRequest) -> dict:
     input_path = Path(request.folder_path or request.file_path)
 
-    resolved_output_mode = request.output_mode or ("elasticsearch" if config.ELASTICSEARCH_CONFIG["enabled"] else "csv")
+    resolved_output_mode = request.output_mode or ("elasticsearch" if settings.elasticsearch.enabled else "csv")
     if resolved_output_mode == "csv" and not request.output_path:
         raise HTTPException(status_code=400, detail="output_path is required when output_mode is 'csv'")
 

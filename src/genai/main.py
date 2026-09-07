@@ -10,10 +10,10 @@ setup_logging(settings.logging)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate Q&A CSV from docx/xlsx documents.")
+    parser = argparse.ArgumentParser(description="Generate Q&A CSV from docx/xlsx/pdf documents.")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", help="Folder to scan recursively for .docx/.xlsx files")
-    source.add_argument("--file", help="Path to a single .docx/.xlsx file")
+    source.add_argument("--input", help="Folder to scan recursively for .docx/.xlsx/.pdf files")
+    source.add_argument("--file", help="Path to a single .docx/.xlsx/.pdf file")
     parser.add_argument("--output", default="questions.csv", help="Output CSV path (ignored when --output-mode elasticsearch)")
     parser.add_argument(
         "--mode",
@@ -30,13 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--questions-per-chunk",
         type=int,
-        default=config.QUESTIONS_PER_CHUNK,
+        default=settings.chunking.questions_per_chunk,
         help="Number of Q&A pairs to generate per chunk/section",
     )
     parser.add_argument(
         "--chunk-chars",
         type=int,
-        default=config.CHUNK_MAX_CHARS,
+        default=settings.chunking.chunk_max_chars,
         help="Approximate max characters per chunk",
     )
     return parser.parse_args()

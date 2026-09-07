@@ -3,6 +3,8 @@ langchain-core
 openai
 python-docx
 openpyxl
+pypdf
+pydantic
 fastapi
 uvicorn
 elasticsearch
