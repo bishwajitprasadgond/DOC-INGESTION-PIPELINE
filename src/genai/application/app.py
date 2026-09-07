@@ -1,6 +1,10 @@
+import logging
+import os
 import tempfile
+import time
 from pathlib import Path
 
+import requests
 from nicegui import run, ui
 
 from ...config import settings
@@ -9,8 +13,21 @@ from ..utils.logging_config import setup_logging
 
 setup_logging(settings.logging)
 
+LOGGER = logging.getLogger("docs_ingestion")
+
+_UI_PORT = int(os.environ.get("CDSW_APP_PORT") or 8080)
+
 _UPLOAD_DIR = Path(tempfile.gettempdir()) / "docs_ingestion_uploads"
 _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _check_backend() -> bool:
+    """True if the configured LLM endpoint accepts a connection (any HTTP response counts)."""
+    try:
+        requests.get(settings.llm.base_url, timeout=3)
+        return True
+    except requests.exceptions.RequestException:
+        return False
 
 ui.colors(primary="#0f3d6e", secondary="#1c6e8c", accent="#2e8b57", positive="#2e8b57")
 
@@ -42,53 +59,51 @@ def main_page():
     uploaded_path: dict[str, Path | None] = {"path": None}
 
     with ui.column().classes("w-full max-w-3xl mx-auto px-4 py-8 gap-5"):
-        with _section("input", "1. Input Source") as input_section:
-            with input_section:
-                with ui.tabs().classes("w-full") as source_tabs:
-                    tab_upload = ui.tab("Upload File", icon="upload_file")
-                    tab_path = ui.tab("Server Path", icon="folder_open")
+        with _section("input", "1. Input Source"):
+            with ui.tabs().classes("w-full") as source_tabs:
+                tab_upload = ui.tab("Upload File", icon="upload_file")
+                tab_path = ui.tab("Server Path", icon="folder_open")
 
-                with ui.tab_panels(source_tabs, value=tab_upload).classes("w-full border rounded-md"):
-                    with ui.tab_panel(tab_upload):
-                        ui.label("Upload a single .docx / .xlsx / .pdf file").classes("text-sm text-gray-500 mb-2")
+            with ui.tab_panels(source_tabs, value=tab_upload).classes("w-full border rounded-md"):
+                with ui.tab_panel(tab_upload):
+                    ui.label("Upload a single .docx / .xlsx / .pdf file").classes("text-sm text-gray-500 mb-2")
 
-                        def handle_upload(e):
-                            dest = _UPLOAD_DIR / e.name
-                            dest.write_bytes(e.content.read())
-                            uploaded_path["path"] = dest
-                            ui.notify(f"Uploaded {e.name}", color="positive", icon="check_circle")
+                    def handle_upload(e):
+                        dest = _UPLOAD_DIR / e.name
+                        dest.write_bytes(e.content.read())
+                        uploaded_path["path"] = dest
+                        ui.notify(f"Uploaded {e.name}", color="positive", icon="check_circle")
 
-                        ui.upload(on_upload=handle_upload, auto_upload=True).classes("w-full").props(
-                            "flat bordered accept=.docx,.xlsx,.pdf"
-                        )
+                    ui.upload(on_upload=handle_upload, auto_upload=True).classes("w-full").props(
+                        "flat bordered accept=.docx,.xlsx,.pdf"
+                    )
 
-                    with ui.tab_panel(tab_path):
-                        ui.label("Path to a file or folder on the server running this app").classes(
-                            "text-sm text-gray-500 mb-2"
-                        )
-                        path_input = ui.input(placeholder="e.g. src/genai/data").classes("w-full").props(
-                            "outlined dense clearable"
-                        )
+                with ui.tab_panel(tab_path):
+                    ui.label("Path to a file or folder on the server running this app").classes(
+                        "text-sm text-gray-500 mb-2"
+                    )
+                    path_input = ui.input(placeholder="e.g. src/genai/data").classes("w-full").props(
+                        "outlined dense clearable"
+                    )
 
-        with _section("tune", "2. Pipeline Settings") as settings_section:
-            with settings_section:
-                with ui.row().classes("w-full gap-4 flex-wrap"):
-                    output_path_input = ui.input("Output CSV path", value="questions.csv").props(
-                        "outlined dense"
-                    ).classes("flex-1 min-w-[220px]")
-                    mode_select = ui.select(["append", "overwrite"], value="append", label="Write mode").props(
-                        "outlined dense"
-                    ).classes("flex-1 min-w-[160px]")
-                with ui.row().classes("w-full gap-4 flex-wrap"):
-                    output_mode_select = ui.select(
-                        ["auto", "csv", "elasticsearch"], value="auto", label="Output sink"
-                    ).props("outlined dense").classes("flex-1 min-w-[160px]")
-                    questions_input = ui.number(
-                        "Questions per chunk", value=settings.chunking.questions_per_chunk, min=1
-                    ).props("outlined dense").classes("flex-1 min-w-[160px]")
-                    chunk_chars_input = ui.number(
-                        "Chunk max chars", value=settings.chunking.chunk_max_chars, min=100, step=100
-                    ).props("outlined dense").classes("flex-1 min-w-[160px]")
+        with _section("tune", "2. Pipeline Settings"):
+            with ui.row().classes("w-full gap-4 flex-wrap"):
+                output_path_input = ui.input("Output CSV path", value="questions.csv").props(
+                    "outlined dense"
+                ).classes("flex-1 min-w-[220px]")
+                mode_select = ui.select(["append", "overwrite"], value="append", label="Write mode").props(
+                    "outlined dense"
+                ).classes("flex-1 min-w-[160px]")
+            with ui.row().classes("w-full gap-4 flex-wrap"):
+                output_mode_select = ui.select(
+                    ["auto", "csv", "elasticsearch"], value="auto", label="Output sink"
+                ).props("outlined dense").classes("flex-1 min-w-[160px]")
+                questions_input = ui.number(
+                    "Questions per chunk", value=settings.chunking.questions_per_chunk, min=1
+                ).props("outlined dense").classes("flex-1 min-w-[160px]")
+                chunk_chars_input = ui.number(
+                    "Chunk max chars", value=settings.chunking.chunk_max_chars, min=100, step=100
+                ).props("outlined dense").classes("flex-1 min-w-[160px]")
 
         with ui.row().classes("w-full justify-end"):
             run_button = ui.button("Run Ingestion", icon="play_arrow", on_click=lambda: on_run()).props(
