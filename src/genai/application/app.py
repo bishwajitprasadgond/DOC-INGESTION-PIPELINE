@@ -29,6 +29,7 @@ def _check_backend() -> bool:
     except requests.exceptions.RequestException:
         return False
 
+
 ui.colors(primary="#0f3d6e", secondary="#1c6e8c", accent="#2e8b57", positive="#2e8b57")
 
 
@@ -115,7 +116,7 @@ def main_page():
         async def on_run():
             result_card.clear()
 
-            if source_tabs.value == tab_upload:
+            if source_tabs.value == "Upload File":
                 if uploaded_path["path"] is None:
                     ui.notify("Upload a file first", color="negative", icon="error")
                     return
@@ -179,5 +180,31 @@ def main_page():
                             ).props("outline color=primary")
 
 
+def main() -> None:
+    LOGGER.info("Doc Q&A Ingestion UI starting on port %d...", _UI_PORT)
+    LOGGER.info("Backend target: %s", settings.llm.base_url)
+
+    for attempt in range(1, 4):
+        if _check_backend():
+            LOGGER.info("Backend health-check: OK")
+            break
+        LOGGER.info("Waiting for backend... (attempt %d/3)", attempt)
+        time.sleep(3)
+    else:
+        LOGGER.warning("Backend not responding, UI will start anyway.")
+
+    print("CDSW_APP_PORT =", os.getenv("CDSW_APP_PORT"))
+    print("CDSW_READONLY_PORT =", os.getenv("CDSW_READONLY_PORT"))
+    print("CB_APP_PORT =", os.getenv("CB_APP_PORT"))
+    print("UI_PORT =", _UI_PORT)
+    print("CDSW_PUBLIC_PORT =", os.getenv("CDSW_PUBLIC_PORT"))
+    print(f"  Doc Q&A Ingestion UI  ->  http://127.0.0.1:{_UI_PORT}")
+    print(f"  Backend target        ->  {settings.llm.base_url}")
+    print("  Press Ctrl+C to stop.\n")
+    LOGGER.info("UI ready at http://127.0.0.1:%d", _UI_PORT)
+
+    ui.run(title="Doc Q&A Ingestion", port=_UI_PORT, reload=False)
+
+
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="Doc Q&A Ingestion", port=8080, reload=False)
+    main()
