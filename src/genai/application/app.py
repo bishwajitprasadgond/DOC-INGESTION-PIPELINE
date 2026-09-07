@@ -30,9 +30,6 @@ def _check_backend() -> bool:
         return False
 
 
-ui.colors(primary="#0f3d6e", secondary="#1c6e8c", accent="#2e8b57", positive="#2e8b57")
-
-
 def _section(icon: str, title: str):
     with ui.card().classes("w-full shadow-sm rounded-lg border border-gray-200 p-5"):
         with ui.row().classes("items-center gap-2 mb-4"):
@@ -44,6 +41,7 @@ def _section(icon: str, title: str):
 
 @ui.page("/")
 def main_page():
+    ui.colors(primary="#0f3d6e", secondary="#1c6e8c", accent="#2e8b57", positive="#2e8b57")
     ui.query("body").classes("bg-gray-50")
     ui.add_head_html(
         "<style>.q-field__label{font-weight:500} .nicegui-content{padding:0 !important}</style>"
