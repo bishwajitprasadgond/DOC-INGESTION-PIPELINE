@@ -12,7 +12,7 @@ import logging
 
 from elasticsearch import Elasticsearch, ConnectionError as ESConnectionError, TransportError
 
-from exceptions import ElasticsearchConnectionError, RagConfigurationError
+from .exceptions import ElasticsearchConnectionError, RagConfigurationError
 
 LOGGER = logging.getLogger("docs_ingestion")
 

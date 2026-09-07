@@ -4,11 +4,12 @@ from pathlib import Path
 
 from docx import Document
 from openpyxl import load_workbook
+from pypdf import PdfReader
 
-import config
-from generator import classify_table_headers
+from ...config import settings
+from .generator import classify_table_headers
 
-DEFAULT_CHUNK_MAX_CHARS = config.CHUNK_MAX_CHARS
+DEFAULT_CHUNK_MAX_CHARS = settings.chunking.chunk_max_chars
 
 HEADING_STYLES = {"heading 1", "heading 2", "heading 3", "title"}
 
@@ -194,10 +195,41 @@ def extract_xlsx(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS, cha
     return result
 
 
+def extract_pdf(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS) -> Extraction:
+    reader = PdfReader(str(path))
+    result = Extraction()
+    buffer: list[str] = []
+    buffer_chars = 0
+    start_page = 1
+
+    def flush(end_page: int):
+        nonlocal buffer, buffer_chars, start_page
+        text = "\n".join(buffer).strip()
+        if text:
+            label = f"Page {start_page}" if start_page == end_page else f"Page {start_page}-{end_page}"
+            result.chunks.append(Chunk(section=label, text=text))
+        buffer, buffer_chars = [], 0
+        start_page = end_page + 1
+
+    for page_num, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
+            continue
+        buffer.append(text)
+        buffer_chars += len(text)
+        if buffer_chars > chunk_max_chars:
+            flush(page_num)
+
+    flush(len(reader.pages))
+    return result
+
+
 def extract_document(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS, chat_model=None) -> Extraction:
     ext = path.suffix.lower()
     if ext == ".docx":
         return extract_docx(path, chunk_max_chars, chat_model)
     if ext == ".xlsx":
         return extract_xlsx(path, chunk_max_chars, chat_model)
+    if ext == ".pdf":
+        return extract_pdf(path, chunk_max_chars)
     raise ValueError(f"Unsupported file type: {ext}")

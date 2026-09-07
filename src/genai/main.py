@@ -2,8 +2,11 @@ import argparse
 import sys
 from pathlib import Path
 
-import config
-from pipeline import run_pipeline
+from ..config import settings
+from .ingestion.pipeline import run_pipeline
+from .utils.logging_config import setup_logging
+
+setup_logging(settings.logging)
 
 
 def parse_args() -> argparse.Namespace:

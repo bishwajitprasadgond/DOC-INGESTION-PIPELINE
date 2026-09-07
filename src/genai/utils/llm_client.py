@@ -3,19 +3,20 @@ import re
 
 from langchain_openai import ChatOpenAI
 
-from config import LLM_CONFIG
+from ...config import settings
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
 def get_chat_model() -> ChatOpenAI:
+    llm = settings.llm
     return ChatOpenAI(
-        base_url=LLM_CONFIG["base_url"],
-        api_key=LLM_CONFIG["api_key"],
-        model=LLM_CONFIG["model_name"],
-        temperature=LLM_CONFIG["temperature"],
-        max_tokens=LLM_CONFIG["max_tokens"],
-        timeout=LLM_CONFIG["timeout"],
+        base_url=llm.base_url,
+        api_key=llm.api_key,
+        model=llm.model_name,
+        temperature=llm.temperature,
+        max_tokens=llm.max_tokens,
+        timeout=llm.timeout,
     )
 
 

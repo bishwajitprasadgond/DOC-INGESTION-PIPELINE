@@ -30,3 +30,10 @@ max_retries = 3
 retry_on_timeout = true
 verify_certs = true
 connections_per_node = 10
+
+[logging]
+level = "INFO"
+dir = "logs"
+filename = "ingestion.log"
+max_bytes = 5000000
+backup_count = 3

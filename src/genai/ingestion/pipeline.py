@@ -1,12 +1,15 @@
 import csv
+import logging
 import uuid
 from datetime import date
 from pathlib import Path
 
-import config
-from extractors import extract_document
-from generator import classify_qa_row, generate_doc_metadata, generate_qa_for_chunk
-from llm_client import get_chat_model
+from ...config import ElasticsearchConfig, settings
+from ..utils.llm_client import get_chat_model
+from .extractors import extract_document
+from .generator import classify_qa_row, generate_doc_metadata, generate_qa_for_chunk
+
+logger = logging.getLogger("docs_ingestion")
 
 CSV_FIELDS = [
     "Document-id",
@@ -24,7 +27,7 @@ CSV_FIELDS = [
 
 DOC_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
-SUPPORTED_EXTENSIONS = {".docx", ".xlsx"}
+SUPPORTED_EXTENSIONS = {".docx", ".xlsx", ".pdf"}
 
 
 def document_id(path: Path) -> str:
@@ -54,7 +57,7 @@ def _resolve_row_category(chat_model, row, doc_category: str, doc_sub_category: 
     try:
         classified = classify_qa_row(chat_model, row.question, row.answer)
     except ValueError as exc:
-        print(f"  warning: failed to classify table row '{row.question[:60]}...': {exc}")
+        logger.warning("  failed to classify table row '%s...': %s", row.question[:60], exc)
         return category or doc_category, sub_category or doc_sub_category
 
     return category or classified["category"] or doc_category, sub_category or classified["sub_category"] or doc_sub_category
@@ -70,13 +73,13 @@ def process_document(
     extraction = extract_document(path, chunk_max_chars, chat_model)
     chunks, table_qa = extraction.chunks, extraction.table_qa
     if not chunks and not table_qa:
-        print(f"  no extractable content, skipping")
+        logger.info("  no extractable content, skipping")
         return []
 
     if chunks:
-        sample = "\n\n".join(c.text for c in chunks)[: config.METADATA_SAMPLE_CHARS]
+        sample = "\n\n".join(c.text for c in chunks)[: settings.chunking.metadata_sample_chars]
     else:
-        sample = "\n".join(f"Q: {r.question}\nA: {r.answer}" for r in table_qa)[: config.METADATA_SAMPLE_CHARS]
+        sample = "\n".join(f"Q: {r.question}\nA: {r.answer}" for r in table_qa)[: settings.chunking.metadata_sample_chars]
     metadata = generate_doc_metadata(chat_model, sample)
 
     qa_pairs: list[dict] = []
@@ -84,7 +87,7 @@ def process_document(
         try:
             generated = generate_qa_for_chunk(chat_model, chunk.section, chunk.text, questions_per_chunk)
         except ValueError as exc:
-            print(f"  warning: failed to generate questions for section '{chunk.section}': {exc}")
+            logger.warning("  failed to generate questions for section '%s': %s", chunk.section, exc)
             continue
         for pair in generated:
             qa_pairs.append({**pair, "category": None, "sub_category": None, "serial_no": None})
@@ -122,7 +125,7 @@ def process_document(
             }
         )
     if table_qa:
-        print(f"  {len(table_qa)} question(s) taken directly from table(s), {len(qa_pairs) - len(table_qa)} generated")
+        logger.info("  %d question(s) taken directly from table(s), %d generated", len(table_qa), len(qa_pairs) - len(table_qa))
     return rows
 
 
@@ -157,26 +160,26 @@ class _CsvSink:
 class _ElasticsearchSink:
     """Pushes rows into Elasticsearch as vector-searchable documents, one embedding per row."""
 
-    def __init__(self, es_config: dict):
+    def __init__(self, es_config: ElasticsearchConfig):
         from elasticsearch import helpers as es_helpers
 
-        from embeddings import embed_row
-        from es_client import build_es_client, ensure_index
+        from ..utils.embeddings import embed_row
+        from ..utils.es_client import build_es_client, ensure_index
 
         self._bulk = es_helpers.bulk
         self._embed_row = embed_row
-        self._index_name = es_config["index_name"]
+        self._index_name = es_config.index_name
         self._client = build_es_client(
-            host=es_config["host"],
-            api_key=es_config["api_key"],
-            request_timeout=es_config["request_timeout"],
-            max_retries=es_config["max_retries"],
-            retry_on_timeout=es_config["retry_on_timeout"],
-            verify_certs=es_config["verify_certs"],
-            connections_per_node=es_config["connections_per_node"],
+            host=es_config.host,
+            api_key=es_config.api_key,
+            request_timeout=es_config.request_timeout,
+            max_retries=es_config.max_retries,
+            retry_on_timeout=es_config.retry_on_timeout,
+            verify_certs=es_config.verify_certs,
+            connections_per_node=es_config.connections_per_node,
         )
-        fields = es_config["fields"] or CSV_FIELDS
-        ensure_index(self._client, self._index_name, es_config["index_mode"], fields, config.EMBEDDINGS_CONFIG["dimension"])
+        fields = es_config.fields or CSV_FIELDS
+        ensure_index(self._client, self._index_name, es_config.index_mode, fields, settings.embeddings.dimension)
 
     def write(self, rows: list[dict]) -> None:
         actions = []
@@ -193,7 +196,7 @@ class _ElasticsearchSink:
 def _open_sink(output_mode: str, output_path: Path | None, mode: str):
     if output_mode == "csv":
         return _CsvSink(output_path, mode)
-    return _ElasticsearchSink(config.ELASTICSEARCH_CONFIG)
+    return _ElasticsearchSink(settings.elasticsearch)
 
 
 def run_pipeline(
@@ -207,14 +210,14 @@ def run_pipeline(
     if mode not in ("append", "overwrite"):
         raise ValueError(f"Invalid mode: {mode!r} (expected 'append' or 'overwrite')")
 
-    output_mode = output_mode or ("elasticsearch" if config.ELASTICSEARCH_CONFIG["enabled"] else "csv")
+    output_mode = output_mode or ("elasticsearch" if settings.elasticsearch.enabled else "csv")
     if output_mode not in ("csv", "elasticsearch"):
         raise ValueError(f"Invalid output_mode: {output_mode!r} (expected 'csv' or 'elasticsearch')")
     if output_mode == "csv" and not output_path:
         raise ValueError("output_path is required when output_mode is 'csv'")
 
-    questions_per_chunk = questions_per_chunk or config.QUESTIONS_PER_CHUNK
-    chunk_max_chars = chunk_max_chars or config.CHUNK_MAX_CHARS
+    questions_per_chunk = questions_per_chunk or settings.chunking.questions_per_chunk
+    chunk_max_chars = chunk_max_chars or settings.chunking.chunk_max_chars
     ingestion_date = date.today().isoformat()
 
     def _summary(files_processed: int, files_skipped: int, total_questions: int) -> dict:
@@ -222,12 +225,12 @@ def run_pipeline(
         if output_mode == "csv":
             summary["output_path"] = str(output_path)
         else:
-            summary["index_name"] = config.ELASTICSEARCH_CONFIG["index_name"]
+            summary["index_name"] = settings.elasticsearch.index_name
         return summary
 
     files = resolve_input_files(input_path)
     if not files:
-        print(f"No .docx/.xlsx files found under {input_path}")
+        logger.info("No %s files found under %s", "/".join(sorted(SUPPORTED_EXTENSIONS)), input_path)
         return _summary(0, 0, 0)
 
     chat_model = get_chat_model()
@@ -239,11 +242,11 @@ def run_pipeline(
     sink = _open_sink(output_mode, output_path, mode)
     try:
         for path in files:
-            print(f"Processing {path} ...")
+            logger.info("Processing %s ...", path)
             try:
                 rows = process_document(path, chat_model, questions_per_chunk, chunk_max_chars, ingestion_date)
             except Exception as exc:
-                print(f"  error: {exc}, skipping file")
+                logger.error("  error: %s, skipping file", exc)
                 files_skipped += 1
                 continue
 
@@ -254,7 +257,7 @@ def run_pipeline(
             sink.write(rows)
             files_processed += 1
             total_questions += len(rows)
-            print(f"  {len(rows)} questions generated")
+            logger.info("  %d questions generated", len(rows))
     finally:
         sink.close()
 

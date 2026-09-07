@@ -2,7 +2,7 @@ import json
 
 from langchain_openai import ChatOpenAI
 
-from llm_client import invoke_json
+from ..utils.llm_client import invoke_json
 
 METADATA_PROMPT = """You are analyzing a business document to catalog it.
 Read the excerpt below and respond with ONLY a JSON object (no markdown fences) in this exact shape:
