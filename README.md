@@ -66,7 +66,8 @@ DOC-INGESTION-PIPELINE/
         │   ├── exceptions.py       # RagConfigurationError, ElasticsearchConnectionError
         │   └── logging_config.py   # attaches the root logs/ file + console handlers
         └── application/
-            └── app.py              # NiceGUI web UI for triggering the pipeline
+            ├── app.py              # NiceGUI web UI for triggering the pipeline
+            └── launcher.py         # starts the API backend + UI together (CDSW/CML friendly)
 ```
 
 Everything under `src/genai/` is a regular Python package and uses relative
@@ -334,6 +335,23 @@ Cloudera CDSW/CML), separate from the API's `8000`, so both can run at once.
 On startup it retries the configured LLM endpoint up to 3 times (logged to
 `logs/ingestion.log`) and starts the UI regardless of the outcome — a slow or
 unreachable backend never blocks the page from loading.
+
+### Launching backend + UI together
+
+[application/launcher.py](src/genai/application/launcher.py) starts the
+FastAPI backend and the NiceGUI UI as two sibling processes from one command —
+useful for CDSW/CML "Application" deployments, where only one process gets
+the platform-assigned port (`$CDSW_APP_PORT`, for the UI) while the backend
+runs on an internal port (`$CB_BACKEND_PORT`, default `8000`).
+
+```bash
+python -m src.genai.application.launcher
+```
+
+It waits for the backend's `/health` endpoint (up to 5 retries, 3s apart,
+starting the UI regardless if it never responds), then launches the UI, and
+monitors both — if either process exits, both are terminated. `Ctrl+C` stops
+both cleanly.
 
 ### Interactive notebook
 
