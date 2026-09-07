@@ -314,10 +314,17 @@ curl -X POST http://localhost:8000/generate \
 
 [application/app.py](src/genai/application/app.py) is a small
 [NiceGUI](https://nicegui.io/) app (pure Python, no HTML/JS) that runs the
-pipeline directly — no separate API server needed.
+pipeline directly — no separate API server needed. NiceGUI is mounted onto
+its own `FastAPI` app (the module-level `app` object), served by
+[uvicorn](https://www.uvicorn.org/), the same ASGI server the backend API
+uses — so it can be run either as a plain script or via the `uvicorn` CLI:
 
 ```bash
+# as a script
 python -m src.genai.application.app
+
+# or via uvicorn directly, same pattern as the backend API
+uvicorn src.genai.application.app:app --host 127.0.0.1 --port 8080
 ```
 
 Then open `http://localhost:8080`. From the page you can:
@@ -351,7 +358,7 @@ python -m src.genai.application.launcher
 It waits for the backend's `/health` endpoint (up to 5 retries, 3s apart,
 starting the UI regardless if it never responds), then launches the UI, and
 monitors both — if either process exits, both are terminated. `Ctrl+C` stops
-both cleanly.
+both cleanly. Both processes are started the same way, as `uvicorn <module>:app`.
 
 ### Interactive notebook
 

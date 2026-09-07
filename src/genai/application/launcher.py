@@ -5,7 +5,16 @@ from pathlib import Path
 
 import requests
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+def _detect_project_root() -> Path:
+    override = os.environ.get("PROJECT_ROOT")
+    if override:
+        return Path(override)
+    if "__file__" in globals():
+        return Path(__file__).resolve().parents[3]
+    return Path.cwd()
+
+
+_PROJECT_ROOT = _detect_project_root()
 _UI_MODULE = "src.genai.application.app"
 _BACKEND_MODULE = "src.genai.api:app"
 
@@ -60,7 +69,7 @@ def launch() -> None:
 
         print(f" Launching UI (NiceGUI) on port {_UI_PORT}...")
         ui_proc = subprocess.Popen(
-            ["python", "-m", _UI_MODULE],
+            ["python", "-m", "uvicorn", f"{_UI_MODULE}:app", "--host", "127.0.0.1", "--port", _UI_PORT],
             cwd=_PROJECT_ROOT,
             env=env,
         )

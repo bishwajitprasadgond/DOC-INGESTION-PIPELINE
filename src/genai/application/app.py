@@ -2,9 +2,12 @@ import logging
 import os
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
+import uvicorn
+from fastapi import FastAPI
 from nicegui import run, ui
 
 from ...config import settings
@@ -28,6 +31,27 @@ def _check_backend() -> bool:
         return True
     except requests.exceptions.RequestException:
         return False
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    LOGGER.info("Doc Q&A Ingestion UI starting on port %d...", _UI_PORT)
+    LOGGER.info("Backend target: %s", settings.llm.base_url)
+
+    for attempt in range(1, 4):
+        if _check_backend():
+            LOGGER.info("Backend health-check: OK")
+            break
+        LOGGER.info("Waiting for backend... (attempt %d/3)", attempt)
+        time.sleep(3)
+    else:
+        LOGGER.warning("Backend not responding, UI will start anyway.")
+
+    LOGGER.info("UI ready at http://127.0.0.1:%d", _UI_PORT)
+    yield
+
+
+app = FastAPI(title="Doc Q&A Ingestion UI", lifespan=_lifespan)
 
 
 def _section(icon: str, title: str):
@@ -178,19 +202,10 @@ def main_page():
                             ).props("outline color=primary")
 
 
+ui.run_with(app, title="Doc Q&A Ingestion")
+
+
 def main() -> None:
-    LOGGER.info("Doc Q&A Ingestion UI starting on port %d...", _UI_PORT)
-    LOGGER.info("Backend target: %s", settings.llm.base_url)
-
-    for attempt in range(1, 4):
-        if _check_backend():
-            LOGGER.info("Backend health-check: OK")
-            break
-        LOGGER.info("Waiting for backend... (attempt %d/3)", attempt)
-        time.sleep(3)
-    else:
-        LOGGER.warning("Backend not responding, UI will start anyway.")
-
     print("CDSW_APP_PORT =", os.getenv("CDSW_APP_PORT"))
     print("CDSW_READONLY_PORT =", os.getenv("CDSW_READONLY_PORT"))
     print("CB_APP_PORT =", os.getenv("CB_APP_PORT"))
@@ -199,9 +214,8 @@ def main() -> None:
     print(f"  Doc Q&A Ingestion UI  ->  http://127.0.0.1:{_UI_PORT}")
     print(f"  Backend target        ->  {settings.llm.base_url}")
     print("  Press Ctrl+C to stop.\n")
-    LOGGER.info("UI ready at http://127.0.0.1:%d", _UI_PORT)
 
-    ui.run(title="Doc Q&A Ingestion", port=_UI_PORT, reload=False)
+    uvicorn.run(app, host="127.0.0.1", port=_UI_PORT)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
