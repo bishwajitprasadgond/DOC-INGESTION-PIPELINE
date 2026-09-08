@@ -12,6 +12,7 @@ timeout = 60.0
 chunk_max_chars = 3000
 questions_per_chunk = 3
 metadata_sample_chars = 4000
+concurrency = 4   # max parallel LLM calls per document (chunk Q&A / row classification)
 
 [embeddings]
 model_name = "sentence-transformers/all-MiniLM-L6-v2"

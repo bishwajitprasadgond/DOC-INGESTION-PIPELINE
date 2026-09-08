@@ -1,6 +1,8 @@
 import csv
+import functools
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -54,6 +56,7 @@ def _resolve_row_category(chat_model, row, doc_category: str, doc_sub_category: 
     if category and sub_category:
         return category, sub_category
 
+    logger.info("  agent working: classifying category for row '%s...'", row.question[:60], extra={"milestone": True})
     try:
         classified = classify_qa_row(chat_model, row.question, row.answer)
     except ValueError as exc:
@@ -61,6 +64,15 @@ def _resolve_row_category(chat_model, row, doc_category: str, doc_sub_category: 
         return category or doc_category, sub_category or doc_sub_category
 
     return category or classified["category"] or doc_category, sub_category or classified["sub_category"] or doc_sub_category
+
+
+def _generate_chunk_qa(chat_model, questions_per_chunk: int, chunk) -> list[dict]:
+    logger.info("  agent working: generating Q&A for section '%s'...", chunk.section, extra={"milestone": True})
+    try:
+        return generate_qa_for_chunk(chat_model, chunk.section, chunk.text, questions_per_chunk)
+    except ValueError as exc:
+        logger.warning("  failed to generate questions for section '%s': %s", chunk.section, exc)
+        return []
 
 
 def process_document(
@@ -80,30 +92,36 @@ def process_document(
         sample = "\n\n".join(c.text for c in chunks)[: settings.chunking.metadata_sample_chars]
     else:
         sample = "\n".join(f"Q: {r.question}\nA: {r.answer}" for r in table_qa)[: settings.chunking.metadata_sample_chars]
+    logger.info("  agent working: analyzing document metadata...", extra={"milestone": True})
     metadata = generate_doc_metadata(chat_model, sample)
 
-    qa_pairs: list[dict] = []
-    for chunk in chunks:
-        try:
-            generated = generate_qa_for_chunk(chat_model, chunk.section, chunk.text, questions_per_chunk)
-        except ValueError as exc:
-            logger.warning("  failed to generate questions for section '%s': %s", chunk.section, exc)
-            continue
-        for pair in generated:
-            qa_pairs.append({**pair, "category": None, "sub_category": None, "serial_no": None})
+    concurrency = max(1, settings.chunking.concurrency)
 
-    # Classified one row at a time so a single row's category never leaks into another's LLM call.
-    for row in table_qa:
-        category, sub_category = _resolve_row_category(chat_model, row, metadata["category"], metadata["sub_category"])
-        qa_pairs.append(
-            {
-                "question": row.question,
-                "answer": row.answer,
-                "category": category,
-                "sub_category": sub_category,
-                "serial_no": row.serial_no or None,
-            }
-        )
+    qa_pairs: list[dict] = []
+    if chunks:
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(chunks))) as pool:
+            chunk_results = pool.map(functools.partial(_generate_chunk_qa, chat_model, questions_per_chunk), chunks)
+            for generated in chunk_results:
+                for pair in generated:
+                    qa_pairs.append({**pair, "category": None, "sub_category": None, "serial_no": None})
+
+    # Each row is classified independently (its own LLM call) so results stay order-matched via pool.map.
+    if table_qa:
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(table_qa))) as pool:
+            categories = pool.map(
+                functools.partial(_resolve_row_category, chat_model, doc_category=metadata["category"], doc_sub_category=metadata["sub_category"]),
+                table_qa,
+            )
+            for row, (category, sub_category) in zip(table_qa, categories):
+                qa_pairs.append(
+                    {
+                        "question": row.question,
+                        "answer": row.answer,
+                        "category": category,
+                        "sub_category": sub_category,
+                        "serial_no": row.serial_no or None,
+                    }
+                )
 
     doc_id = document_id(path)
     ext = path.suffix.lower().lstrip(".")
@@ -231,7 +249,14 @@ def run_pipeline(
     files = resolve_input_files(input_path)
     if not files:
         logger.info("No %s files found under %s", "/".join(sorted(SUPPORTED_EXTENSIONS)), input_path)
-        return _summary(0, 0, 0)
+        summary = _summary(0, 0, 0)
+        logger.info(
+            "Ingestion completed: 0 processed, 0 skipped, 0 questions -> %s (%s)",
+            output_mode,
+            summary.get("output_path") or summary.get("index_name"),
+            extra={"milestone": True},
+        )
+        return summary
 
     chat_model = get_chat_model()
 

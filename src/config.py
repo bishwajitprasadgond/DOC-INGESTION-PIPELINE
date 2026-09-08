@@ -22,6 +22,7 @@ class ChunkingConfig(BaseModel):
     chunk_max_chars: int = 3000
     questions_per_chunk: int = 3
     metadata_sample_chars: int = 4000
+    concurrency: int = 4
 
 
 class EmbeddingsConfig(BaseModel):

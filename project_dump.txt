@@ -1,0 +1,2119 @@
+====================================================================================================
+PROJECT STRUCTURE
+====================================================================================================
+
+DOC-INGESTION-PIPELINE/
+    |-- .gitignore
+    |-- README.md
+    |-- config.toml
+    |-- requirements.txt
+    |-- src/
+        |-- __init__.py
+        |-- config.py
+        |-- genai/
+            |-- __init__.py
+            |-- api.py
+            |-- main.py
+            |-- notebook.ipynb
+            |-- application/
+                |-- __init__.py
+                |-- app.py
+            |-- data/
+            |-- ingestion/
+                |-- __init__.py
+                |-- extractors.py
+                |-- generator.py
+                |-- pipeline.py
+            |-- prompt/
+                |-- __init__.py
+                |-- loader.py
+                |-- prompts.toml
+            |-- utils/
+                |-- __init__.py
+                |-- embeddings.py
+                |-- es_client.py
+                |-- exceptions.py
+                |-- llm_client.py
+                |-- logging_config.py
+
+====================================================================================================
+FILE CONTENTS
+====================================================================================================
+
+####################################################################################################
+FILE: .gitignore
+####################################################################################################
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+logs/*.log
+logs/*.log.*
+
+*.csv
+
+
+
+####################################################################################################
+FILE: README.md
+####################################################################################################
+
+# Docs Ingestion
+
+Agentic pipeline that scans `.docx` / `.xlsx` / `.pdf` documents and produces
+quiz-style Question/Answer data, either as a CSV file or pushed into
+Elasticsearch as vector-searchable documents. An OpenAI-compatible LLM (served
+via vLLM), wired up through [LangChain](https://python.langchain.com/), is
+used to generate questions from free-text sections, infer document metadata,
+and fill in missing table fields; a local `sentence-transformers` model
+computes embeddings when the Elasticsearch sink is used.
+
+Runs as a CLI, a backend API, or an interactive web UI — see
+[Running it](#running-it).
+
+## How it works
+
+- **Free-text sections** (paragraphs/pages/rows with no existing Q&A table):
+  chunked by heading (docx), page (pdf), or sheet/row-batch (xlsx), then sent
+  to the LLM to generate a configurable number of Q&A pairs per chunk.
+- **Existing Q&A tables** (a table/sheet that already has Question + Answer
+  columns): rows are extracted directly instead of regenerating questions.
+  - If the table also has Category / Sub-category columns, those are used;
+    otherwise the LLM classifies each row individually (one call per row, so
+    one row's context never leaks into another's).
+  - If it has a Serial No column, that value is kept in the output instead of
+    the auto-incrementing counter.
+  - If the header names aren't recognized by the built-in keyword list (e.g.
+    "Prompt Text" / "Correct Reply" instead of "Question" / "Answer"), the
+    LLM is given just the header row and asked to map columns before falling
+    back to treating the table as plain text.
+- **PDFs** have no table detection — every PDF is extracted as free-text
+  chunks (grouped by page span) and run through the same Q&A generation path
+  as a docx section.
+- **Output**: CSV file, or an Elasticsearch index (one document per Q&A row,
+  with an `embedding` vector field).
+- **LLM calls** go through [LangChain](https://python.langchain.com/): prompts
+  are `langchain_core.prompts.PromptTemplate` objects loaded from
+  [prompts.toml](src/genai/prompt/prompts.toml), and responses are parsed with
+  `langchain_core.output_parsers.JsonOutputParser`, retrying with a
+  correction message if the model returns invalid JSON.
+
+## Project layout
+
+```
+DOC-INGESTION-PIPELINE/
+├── config.toml                    # all settings (LLM, chunking, embeddings, ES, logging)
+├── requirements.txt
+├── logs/                          # rotating log files (created at runtime)
+└── src/
+    ├── config.py                  # pydantic Settings, loads ../config.toml + env overrides
+    └── genai/
+        ├── main.py                 # CLI entry point
+        ├── api.py                  # FastAPI backend
+        ├── notebook.ipynb          # calls the running API with `requests`
+        ├── data/                   # sample .docx/.xlsx/.pdf inputs
+        ├── ingestion/
+        │   ├── extractors.py       # .docx/.xlsx/.pdf parsing, chunking, Q&A table detection
+        │   ├── generator.py        # LLM-driven metadata/classification/Q&A generation
+        │   └── pipeline.py         # shared orchestration used by the CLI, API, and UI
+        ├── prompt/
+        │   ├── prompts.toml        # one [role] section per prompt (metadata/category/header_map/qa)
+        │   └── loader.py           # loads prompts.toml into PromptTemplate objects
+        ├── utils/
+        │   ├── llm_client.py       # chat model factory + strict-JSON invocation helper
+        │   ├── embeddings.py       # local sentence-transformers embedding model
+        │   ├── es_client.py        # Elasticsearch client factory + index creation
+        │   ├── exceptions.py       # RagConfigurationError, ElasticsearchConnectionError
+        │   └── logging_config.py   # attaches the root logs/ file + console handlers
+        └── application/
+            └── app.py              # NiceGUI web UI for triggering the pipeline
+```
+
+Everything under `src/genai/` is a regular Python package and uses relative
+imports (`from ..utils.llm_client import ...`), so it must be run as a module
+from the **repository root**, not as a standalone script — see the commands
+below.
+
+## Requirements
+
+```bash
+pip install -r requirements.txt
+```
+
+`sentence-transformers` is only imported when the Elasticsearch sink is
+actually used, so a CSV-only setup doesn't need it downloaded/working.
+
+## Configuration — `config.toml`
+
+All settings are loaded from [config.toml](config.toml) at the repository
+root via [src/config.py](src/config.py), which parses it into a validated
+pydantic `Settings` object (`from src.config import settings`). Secrets can be
+overridden via environment variables without editing the file.
+
+```toml
+[llm]
+base_url = "http://10.190.236.15:9000/api/v1"   # override: LLM_BASE_URL
+api_key = "sk-..."                               # override: LLM_API_KEY
+model_name = "google/gemma-4-31b-it"             # override: LLM_MODEL
+max_tokens = 1024
+temperature = 0.2
+timeout = 60.0
+
+[chunking]
+chunk_max_chars = 3000        # approx. max chars per chunk sent to the LLM
+questions_per_chunk = 3       # Q&A pairs generated per chunk
+metadata_sample_chars = 4000  # text sample used to infer title/keywords/category
+
+[embeddings]
+model_name = "sentence-transformers/all-MiniLM-L6-v2"
+dimension = 384
+device = "cpu"
+
+[elasticsearch]
+enabled = false                # default sink: false = csv, true = elasticsearch
+host = "https://localhost:9200"           # override: ELASTICSEARCH__HOST
+api_key = ""                              # override: ELASTICSEARCH__API_KEY
+index_name = "docs-qa"
+index_mode = "create"          # "create": create the index if missing (never deletes an existing one)
+                                # "append": index must already exist, else it's an error
+fields = ["Document-id", "Document-type", "Document-url", "Ingestion-date",
+          "Title", "Keywords", "Category", "Sub-category", "Serial-no",
+          "Question", "Solutions"]
+request_timeout = 30
+max_retries = 3
+retry_on_timeout = true
+verify_certs = true
+connections_per_node = 10
+
+[logging]
+level = "INFO"
+dir = "logs"                   # relative to the repo root
+filename = "ingestion.log"
+max_bytes = 5000000
+backup_count = 3
+```
+
+## Prompts — `src/genai/prompt/prompts.toml`
+
+The four LLM prompts (`metadata`, `category`, `header_map`, `qa`) live in
+[prompts.toml](src/genai/prompt/prompts.toml) instead of being hard-coded in
+Python. Each section has a single `template` key using the placeholders
+[generator.py](src/genai/ingestion/generator.py) fills in (e.g. `{text}`,
+`{question}`/`{answer}`, `{headers}`, `{section}`/`{n}`/`{text}`). Edit the
+wording there to change how the LLM is instructed without touching any code —
+[loader.py](src/genai/prompt/loader.py) reloads them into
+`langchain_core.prompts.PromptTemplate` objects at import time.
+
+## Logging
+
+[logging_config.py](src/genai/utils/logging_config.py) attaches a rotating
+file handler (`logs/ingestion.log` at the repo root, rotated per
+`[logging]` settings) and a console handler to the shared `"docs_ingestion"`
+logger. It's called once, at import time, from `main.py`, `api.py`, and
+`application/app.py`, so every entry point logs to the same place.
+
+## CSV output columns
+
+```
+Document-id, Document-type, Document-url, Ingestion-date, Title, Keywords,
+Category, Sub-category, Serial-no, Question, Solutions
+```
+
+## Running it
+
+All commands are run from the **repository root**.
+
+### CLI
+
+```bash
+# Scan a folder recursively, write/append to a CSV
+python -m src.genai.main --input src/genai/data --output questions.csv
+
+# Process a single file (.docx/.xlsx/.pdf)
+python -m src.genai.main --file src/genai/data/FAQ.pdf --output questions.csv
+
+# Overwrite instead of appending
+python -m src.genai.main --input src/genai/data --output questions.csv --mode overwrite
+
+# Push straight to Elasticsearch instead of CSV
+python -m src.genai.main --input src/genai/data --output-mode elasticsearch
+
+# Tune chunking/generation
+python -m src.genai.main --input src/genai/data --output questions.csv --questions-per-chunk 5 --chunk-chars 2000
+```
+
+| Flag | Description |
+|---|---|
+| `--input <folder>` | Recursively scan a folder for `.docx`/`.xlsx`/`.pdf` (mutually exclusive with `--file`) |
+| `--file <path>` | Process a single `.docx`/`.xlsx`/`.pdf` file |
+| `--output <path>` | CSV output path (default `questions.csv`; ignored when `--output-mode elasticsearch`) |
+| `--mode {append,overwrite}` | CSV write mode (default `append`) |
+| `--output-mode {csv,elasticsearch}` | Output sink (default: `elasticsearch.enabled` in `config.toml`) |
+| `--questions-per-chunk <n>` | Override `chunking.questions_per_chunk` |
+| `--chunk-chars <n>` | Override `chunking.chunk_max_chars` |
+
+### Backend API
+
+The same pipeline is exposed as a synchronous FastAPI service — a request
+blocks until the run finishes and returns a summary.
+
+```bash
+uvicorn src.genai.api:app --host 0.0.0.0 --port 8000
+
+# with auto-reload during local development
+uvicorn src.genai.api:app --reload --port 8000
+```
+
+Interactive docs are auto-generated by FastAPI at `http://localhost:8000/docs`.
+
+#### `GET /health`
+
+```bash
+curl http://localhost:8000/health
+```
+
+```json
+{"status": "ok"}
+```
+
+#### `POST /generate`
+
+Runs the pipeline once and returns a summary. Provide **exactly one** of
+`folder_path` / `file_path`.
+
+**Request body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `folder_path` | string | one of `folder_path`/`file_path` | recursively scanned |
+| `file_path` | string | one of `folder_path`/`file_path` | single `.docx`/`.xlsx`/`.pdf` |
+| `output_path` | string | required if the resolved sink is `csv` | ignored for `elasticsearch` |
+| `mode` | `"append"` \| `"overwrite"` | no (default `"append"`) | CSV only |
+| `output_mode` | `"csv"` \| `"elasticsearch"` | no | defaults to `elasticsearch.enabled` in `config.toml` |
+| `questions_per_chunk` | int | no | overrides `config.toml` |
+| `chunk_chars` | int | no | overrides `config.toml` |
+
+**Example — folder scan to CSV**
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "folder_path": "./src/genai/data",
+        "output_path": "questions.csv",
+        "mode": "append"
+      }'
+```
+
+```json
+{
+  "files_processed": 3,
+  "files_skipped": 0,
+  "total_questions": 42,
+  "sink": "csv",
+  "output_path": "questions.csv",
+  "index_name": null
+}
+```
+
+**Example — single PDF to CSV**
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "file_path": "./src/genai/data/FAQ.pdf",
+        "output_path": "questions.csv"
+      }'
+```
+
+**Example — push to Elasticsearch**
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "folder_path": "./src/genai/data",
+        "output_mode": "elasticsearch"
+      }'
+```
+
+```json
+{
+  "files_processed": 3,
+  "files_skipped": 0,
+  "total_questions": 42,
+  "sink": "elasticsearch",
+  "output_path": null,
+  "index_name": "docs-qa"
+}
+```
+
+**Error responses**
+
+- `422 Unprocessable Entity` — request body failed validation (e.g. both or
+  neither of `folder_path`/`file_path` given).
+- `400 Bad Request` — application-level error (path not found, unsupported
+  file type, `output_path` missing when the sink is `csv`, invalid
+  `elasticsearch.index_mode`, etc.), with the reason in `detail`.
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"output_path": "questions.csv"}'
+# -> 422, neither folder_path nor file_path given
+
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"folder_path": "./does-not-exist", "output_path": "questions.csv"}'
+# -> 400 {"detail": "Input path not found: does-not-exist"}
+```
+
+### Web UI
+
+[application/app.py](src/genai/application/app.py) is a small
+[NiceGUI](https://nicegui.io/) app (pure Python, no HTML/JS) that runs the
+pipeline directly — no separate API server needed.
+
+```bash
+python -m src.genai.application.app
+```
+
+Then open `http://localhost:8080`. From the page you can:
+
+- Provide input either by uploading a single `.docx`/`.xlsx`/`.pdf` file, or
+  by typing a file/folder path that exists on the machine running the app
+  (same semantics as `--file`/`--input`).
+- Set the output CSV path, write mode, output sink, questions-per-chunk, and
+  chunk-max-chars — all defaulted from `config.toml`.
+- Click **Run ingestion** to run the pipeline (off the UI thread) and see the
+  resulting summary, with a download button for the CSV when that's the sink.
+
+Runs on port `8080` by default (or `$CDSW_APP_PORT` when set, for hosting on
+Cloudera CDSW/CML), separate from the API's `8000`, so both can run at once.
+On startup it retries the configured LLM endpoint up to 3 times (logged to
+`logs/ingestion.log`) and starts the UI regardless of the outcome — a slow or
+unreachable backend never blocks the page from loading.
+
+### Interactive notebook
+
+[notebook.ipynb](src/genai/notebook.ipynb) exercises the running API
+cell-by-cell with `requests`: health check, single-file/folder-scan CSV
+generation, an Elasticsearch push, the `422`/`400` error cases, and reading
+the resulting CSV back with `pandas`. Start the server
+(`uvicorn src.genai.api:app --port 8000`), then open and run the notebook top
+to bottom.
+
+
+
+####################################################################################################
+FILE: config.toml
+####################################################################################################
+
+[llm]
+id = "gemma_4_31b"
+name = "Gemma-4 31B (vLLM)"
+base_url = "http://10.190.236.15:9000/api/v1"
+api_key = "sk-5f113ba3077849f3bfbb8b5214343c7b"
+model_name = "google/gemma-4-31b-it"
+max_tokens = 1024
+temperature = 0.2
+timeout = 60.0
+
+[chunking]
+chunk_max_chars = 3000
+questions_per_chunk = 3
+metadata_sample_chars = 4000
+
+[embeddings]
+model_name = "sentence-transformers/all-MiniLM-L6-v2"
+dimension = 384
+device = "cpu"
+
+[elasticsearch]
+enabled = false
+host = "https://localhost:9200"
+api_key = ""
+index_name = "docs-qa"
+index_mode = "create"
+fields = ["Document-id", "Document-type", "Document-url", "Ingestion-date", "Title", "Keywords", "Category", "Sub-category", "Serial-no", "Question", "Solutions"]
+request_timeout = 30
+max_retries = 3
+retry_on_timeout = true
+verify_certs = true
+connections_per_node = 10
+
+[logging]
+level = "INFO"
+dir = "logs"
+filename = "ingestion.log"
+max_bytes = 5000000
+backup_count = 3
+
+
+
+####################################################################################################
+FILE: requirements.txt
+####################################################################################################
+
+langchain-openai
+langchain-core
+openai
+python-docx
+openpyxl
+pypdf
+pydantic
+fastapi
+uvicorn
+nicegui
+elasticsearch
+sentence-transformers
+requests
+pandas
+jupyter
+
+
+
+####################################################################################################
+FILE: src\__init__.py
+####################################################################################################
+
+
+
+
+####################################################################################################
+FILE: src\config.py
+####################################################################################################
+
+import os
+import tomllib
+from pathlib import Path
+
+from pydantic import BaseModel
+
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
+
+
+class LLMConfig(BaseModel):
+    id: str = "gemma_4_31b"
+    name: str = "Gemma-4 31B (vLLM)"
+    base_url: str
+    api_key: str
+    model_name: str
+    max_tokens: int = 1024
+    temperature: float = 0.2
+    timeout: float = 60.0
+
+
+class ChunkingConfig(BaseModel):
+    chunk_max_chars: int = 3000
+    questions_per_chunk: int = 3
+    metadata_sample_chars: int = 4000
+
+
+class EmbeddingsConfig(BaseModel):
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    dimension: int = 384
+    device: str = "cpu"
+
+
+class ElasticsearchConfig(BaseModel):
+    enabled: bool = False
+    host: str = "https://localhost:9200"
+    api_key: str = ""
+    index_name: str = "docs-qa"
+    index_mode: str = "create"
+    fields: list[str] = []
+    request_timeout: int = 30
+    max_retries: int = 3
+    retry_on_timeout: bool = True
+    verify_certs: bool = True
+    connections_per_node: int = 10
+
+
+class LoggingConfig(BaseModel):
+    level: str = "INFO"
+    dir: str = "logs"
+    filename: str = "ingestion.log"
+    max_bytes: int = 5_000_000
+    backup_count: int = 3
+
+
+class Settings(BaseModel):
+    llm: LLMConfig
+    chunking: ChunkingConfig = ChunkingConfig()
+    embeddings: EmbeddingsConfig = EmbeddingsConfig()
+    elasticsearch: ElasticsearchConfig = ElasticsearchConfig()
+    logging: LoggingConfig = LoggingConfig()
+
+
+def _load_settings() -> Settings:
+    with _CONFIG_PATH.open("rb") as f:
+        raw = tomllib.load(f)
+
+    llm = dict(raw.get("llm", {}))
+    llm["base_url"] = os.environ.get("LLM_BASE_URL", llm.get("base_url"))
+    llm["api_key"] = os.environ.get("LLM_API_KEY", llm.get("api_key"))
+    llm["model_name"] = os.environ.get("LLM_MODEL", llm.get("model_name"))
+
+    elasticsearch = dict(raw.get("elasticsearch", {}))
+    elasticsearch["host"] = os.environ.get("ELASTICSEARCH__HOST", elasticsearch.get("host", "https://localhost:9200"))
+    elasticsearch["api_key"] = os.environ.get("ELASTICSEARCH__API_KEY", elasticsearch.get("api_key", ""))
+
+    return Settings(
+        llm=llm,
+        chunking=raw.get("chunking", {}),
+        embeddings=raw.get("embeddings", {}),
+        elasticsearch=elasticsearch,
+        logging=raw.get("logging", {}),
+    )
+
+
+settings = _load_settings()
+
+# Repo root, for resolving paths (e.g. the logs/ folder) relative to the project rather than cwd.
+PROJECT_ROOT = _CONFIG_PATH.parent
+
+
+
+####################################################################################################
+FILE: src\genai\__init__.py
+####################################################################################################
+
+
+
+
+####################################################################################################
+FILE: src\genai\api.py
+####################################################################################################
+
+from pathlib import Path
+from typing import Literal, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, model_validator
+
+from ..config import settings
+from .ingestion.pipeline import run_pipeline
+from .utils.logging_config import setup_logging
+
+setup_logging(settings.logging)
+
+app = FastAPI(title="Doc Q&A Ingestion API")
+
+
+class GenerateRequest(BaseModel):
+    folder_path: Optional[str] = None
+    file_path: Optional[str] = None
+    output_path: Optional[str] = None
+    mode: Literal["append", "overwrite"] = "append"
+    output_mode: Optional[Literal["csv", "elasticsearch"]] = None
+    questions_per_chunk: Optional[int] = None
+    chunk_chars: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self):
+        if bool(self.folder_path) == bool(self.file_path):
+            raise ValueError("Provide exactly one of folder_path or file_path")
+        return self
+
+
+class GenerateResponse(BaseModel):
+    files_processed: int
+    files_skipped: int
+    total_questions: int
+    sink: str
+    output_path: Optional[str] = None
+    index_name: Optional[str] = None
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/generate", response_model=GenerateResponse)
+def generate(request: GenerateRequest) -> dict:
+    input_path = Path(request.folder_path or request.file_path)
+
+    resolved_output_mode = request.output_mode or ("elasticsearch" if settings.elasticsearch.enabled else "csv")
+    if resolved_output_mode == "csv" and not request.output_path:
+        raise HTTPException(status_code=400, detail="output_path is required when output_mode is 'csv'")
+
+    try:
+        return run_pipeline(
+            input_path=input_path,
+            output_path=Path(request.output_path) if request.output_path else None,
+            mode=request.mode,
+            questions_per_chunk=request.questions_per_chunk,
+            chunk_max_chars=request.chunk_chars,
+            output_mode=request.output_mode,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+
+####################################################################################################
+FILE: src\genai\main.py
+####################################################################################################
+
+import argparse
+import sys
+from pathlib import Path
+
+from ..config import settings
+from .ingestion.pipeline import run_pipeline
+from .utils.logging_config import setup_logging
+
+setup_logging(settings.logging)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate Q&A CSV from docx/xlsx/pdf documents.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", help="Folder to scan recursively for .docx/.xlsx/.pdf files")
+    source.add_argument("--file", help="Path to a single .docx/.xlsx/.pdf file")
+    parser.add_argument("--output", default="questions.csv", help="Output CSV path (ignored when --output-mode elasticsearch)")
+    parser.add_argument(
+        "--mode",
+        choices=["append", "overwrite"],
+        default="append",
+        help="Append to an existing output CSV, or overwrite it (default: append)",
+    )
+    parser.add_argument(
+        "--output-mode",
+        choices=["csv", "elasticsearch"],
+        default=None,
+        help="Where to write results (default: config.toml's elasticsearch.enabled flag)",
+    )
+    parser.add_argument(
+        "--questions-per-chunk",
+        type=int,
+        default=settings.chunking.questions_per_chunk,
+        help="Number of Q&A pairs to generate per chunk/section",
+    )
+    parser.add_argument(
+        "--chunk-chars",
+        type=int,
+        default=settings.chunking.chunk_max_chars,
+        help="Approximate max characters per chunk",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input) if args.input else Path(args.file)
+
+    try:
+        summary = run_pipeline(
+            input_path=input_path,
+            output_path=Path(args.output),
+            mode=args.mode,
+            questions_per_chunk=args.questions_per_chunk,
+            chunk_max_chars=args.chunk_chars,
+            output_mode=args.output_mode,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    destination = summary.get("output_path") or summary.get("index_name")
+    print(
+        f"\nDone. Files processed: {summary['files_processed']}, skipped: {summary['files_skipped']}, "
+        f"total questions: {summary['total_questions']}. Sink: {summary['sink']} ({destination})"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+####################################################################################################
+FILE: src\genai\notebook.ipynb
+####################################################################################################
+
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "intro",
+   "metadata": {},
+   "source": "# Docs Ingestion API — interactive client\n\nThis notebook calls the backend API defined in [api.py](api.py) using `requests`.\n\nStart the server first, in a terminal, from the repo root:\n\n```bash\nuvicorn src.genai.api:app --host 0.0.0.0 --port 8000\n```\n\nThen run the cells below top to bottom."
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "setup",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import requests\n",
+    "\n",
+    "BASE_URL = \"http://localhost:8000\"\n",
+    "\n",
+    "\n",
+    "def pretty(resp):\n",
+    "    print(resp.status_code)\n",
+    "    try:\n",
+    "        from pprint import pprint\n",
+    "        pprint(resp.json())\n",
+    "    except ValueError:\n",
+    "        print(resp.text)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "health-md",
+   "metadata": {},
+   "source": [
+    "## Health check"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "health",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "resp = requests.get(f\"{BASE_URL}/health\")\n",
+    "pretty(resp)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "single-file-md",
+   "metadata": {},
+   "source": "## Generate — single file, CSV output\n\nProcesses one `.docx`/`.xlsx`/`.pdf` file and writes/appends to a CSV. Uses one of the\nsample files in [data/](data/)."
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "single-file",
+   "metadata": {},
+   "outputs": [],
+   "source": "payload = {\n    \"file_path\": \"./data/bank_faq.xlsx\",\n    \"output_path\": \"questions.csv\",\n    \"mode\": \"append\",\n}\nresp = requests.post(f\"{BASE_URL}/generate\", json=payload)\npretty(resp)"
+  },
+  {
+   "cell_type": "markdown",
+   "id": "folder-md",
+   "metadata": {},
+   "source": "## Generate — folder scan, overwrite CSV\n\nRecursively scans a folder for `.docx`/`.xlsx`/`.pdf` files and overwrites the output CSV\ninstead of appending."
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "folder-scan",
+   "metadata": {},
+   "outputs": [],
+   "source": "payload = {\n    \"folder_path\": \"./data\",\n    \"output_path\": \"questions.csv\",\n    \"mode\": \"overwrite\",\n    \"questions_per_chunk\": 5,\n}\nresp = requests.post(f\"{BASE_URL}/generate\", json=payload)\npretty(resp)"
+  },
+  {
+   "cell_type": "markdown",
+   "id": "es-md",
+   "metadata": {},
+   "source": [
+    "## Generate — push to Elasticsearch\n",
+    "\n",
+    "Same pipeline, but rows are embedded (local `sentence-transformers` model) and bulk-indexed into\n",
+    "Elasticsearch instead of written to CSV. `output_path` is not needed for this sink.\n",
+    "Connection/index settings come from the `[elasticsearch]` section of `config.toml`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "es-generate",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "payload = {\n",
+    "    \"folder_path\": \"./docs\",\n",
+    "    \"output_mode\": \"elasticsearch\",\n",
+    "}\n",
+    "resp = requests.post(f\"{BASE_URL}/generate\", json=payload)\n",
+    "pretty(resp)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "errors-md",
+   "metadata": {},
+   "source": [
+    "## Error handling examples\n",
+    "\n",
+    "- `422` — request body failed validation (e.g. neither/both of `folder_path`/`file_path` given).\n",
+    "- `400` — application-level error (bad path, unsupported file type, missing `output_path` for the `csv` sink, etc.)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "error-422",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# 422: neither folder_path nor file_path given\n",
+    "resp = requests.post(f\"{BASE_URL}/generate\", json={\"output_path\": \"questions.csv\"})\n",
+    "pretty(resp)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "error-400",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# 400: folder does not exist\n",
+    "resp = requests.post(\n",
+    "    f\"{BASE_URL}/generate\",\n",
+    "    json={\"folder_path\": \"./does-not-exist\", \"output_path\": \"questions.csv\"},\n",
+    ")\n",
+    "pretty(resp)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "inspect-md",
+   "metadata": {},
+   "source": [
+    "## Inspect the resulting CSV\n",
+    "\n",
+    "Only useful after running one of the `csv`-sink cells above."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "inspect-csv",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "\n",
+    "df = pd.read_csv(\"questions.csv\")\n",
+    "df.head()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.14"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+
+####################################################################################################
+FILE: src\genai\application\__init__.py
+####################################################################################################
+
+
+
+
+####################################################################################################
+FILE: src\genai\application\app.py
+####################################################################################################
+
+import logging
+import os
+import tempfile
+import time
+from pathlib import Path
+
+import requests
+from nicegui import run, ui
+
+from ...config import settings
+from ..ingestion.pipeline import run_pipeline
+from ..utils.logging_config import setup_logging
+
+setup_logging(settings.logging)
+
+LOGGER = logging.getLogger("docs_ingestion")
+
+_UI_PORT = int(os.environ.get("CDSW_APP_PORT") or 8080)
+
+_UPLOAD_DIR = Path(tempfile.gettempdir()) / "docs_ingestion_uploads"
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _check_backend() -> bool:
+    """True if the configured LLM endpoint accepts a connection (any HTTP response counts)."""
+    try:
+        requests.get(settings.llm.base_url, timeout=3)
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def _section(icon: str, title: str):
+    with ui.card().classes("w-full shadow-sm rounded-lg border border-gray-200 p-5"):
+        with ui.row().classes("items-center gap-2 mb-4"):
+            ui.icon(icon).classes("text-primary text-xl")
+            ui.label(title).classes("text-base font-semibold text-gray-800")
+        content = ui.column().classes("w-full gap-3")
+    return content
+
+
+@ui.page("/")
+def main_page():
+    ui.colors(primary="#0f3d6e", secondary="#1c6e8c", accent="#2e8b57", positive="#2e8b57")
+    ui.query("body").classes("bg-gray-50")
+    ui.add_head_html(
+        "<style>.q-field__label{font-weight:500} .nicegui-content{padding:0 !important}</style>"
+    )
+
+    with ui.header().classes("bg-primary text-white items-center px-6 py-3 shadow-md"):
+        ui.icon("hub").classes("text-2xl")
+        with ui.column().classes("gap-0 ml-2"):
+            ui.label("Doc Q&A Ingestion").classes("text-lg font-semibold leading-tight")
+            ui.label("Document-to-Question/Answer Pipeline").classes("text-xs opacity-80 leading-tight")
+        ui.space()
+        ui.badge(f"{settings.llm.name}", color="secondary").classes("text-xs")
+
+    uploaded_path: dict[str, Path | None] = {"path": None}
+
+    with ui.column().classes("w-full max-w-3xl mx-auto px-4 py-8 gap-5"):
+        with _section("input", "1. Input Source"):
+            with ui.tabs().classes("w-full") as source_tabs:
+                tab_upload = ui.tab("Upload File", icon="upload_file")
+                tab_path = ui.tab("Server Path", icon="folder_open")
+
+            with ui.tab_panels(source_tabs, value=tab_upload).classes("w-full border rounded-md"):
+                with ui.tab_panel(tab_upload):
+                    ui.label("Upload a single .docx / .xlsx / .pdf file").classes("text-sm text-gray-500 mb-2")
+
+                    def handle_upload(e):
+                        dest = _UPLOAD_DIR / e.name
+                        dest.write_bytes(e.content.read())
+                        uploaded_path["path"] = dest
+                        ui.notify(f"Uploaded {e.name}", color="positive", icon="check_circle")
+
+                    ui.upload(on_upload=handle_upload, auto_upload=True).classes("w-full").props(
+                        "flat bordered accept=.docx,.xlsx,.pdf"
+                    )
+
+                with ui.tab_panel(tab_path):
+                    ui.label("Path to a file or folder on the server running this app").classes(
+                        "text-sm text-gray-500 mb-2"
+                    )
+                    path_input = ui.input(placeholder="e.g. src/genai/data").classes("w-full").props(
+                        "outlined dense clearable"
+                    )
+
+        with _section("tune", "2. Pipeline Settings"):
+            with ui.row().classes("w-full gap-4 flex-wrap"):
+                output_path_input = ui.input("Output CSV path", value="questions.csv").props(
+                    "outlined dense"
+                ).classes("flex-1 min-w-[220px]")
+                mode_select = ui.select(["append", "overwrite"], value="append", label="Write mode").props(
+                    "outlined dense"
+                ).classes("flex-1 min-w-[160px]")
+            with ui.row().classes("w-full gap-4 flex-wrap"):
+                output_mode_select = ui.select(
+                    ["auto", "csv", "elasticsearch"], value="auto", label="Output sink"
+                ).props("outlined dense").classes("flex-1 min-w-[160px]")
+                questions_input = ui.number(
+                    "Questions per chunk", value=settings.chunking.questions_per_chunk, min=1
+                ).props("outlined dense").classes("flex-1 min-w-[160px]")
+                chunk_chars_input = ui.number(
+                    "Chunk max chars", value=settings.chunking.chunk_max_chars, min=100, step=100
+                ).props("outlined dense").classes("flex-1 min-w-[160px]")
+
+        with ui.row().classes("w-full justify-end"):
+            run_button = ui.button("Run Ingestion", icon="play_arrow", on_click=lambda: on_run()).props(
+                "unelevated color=primary"
+            ).classes("px-6 py-2 text-sm font-medium")
+
+        result_card = ui.column().classes("w-full")
+
+        async def on_run():
+            result_card.clear()
+
+            if source_tabs.value == "Upload File":
+                if uploaded_path["path"] is None:
+                    ui.notify("Upload a file first", color="negative", icon="error")
+                    return
+                input_path = uploaded_path["path"]
+            else:
+                if not path_input.value:
+                    ui.notify("Enter a server path", color="negative", icon="error")
+                    return
+                input_path = Path(path_input.value)
+
+            output_mode = None if output_mode_select.value == "auto" else output_mode_select.value
+
+            run_button.props("loading")
+            try:
+                summary = await run.io_bound(
+                    run_pipeline,
+                    input_path=input_path,
+                    output_path=Path(output_path_input.value) if output_path_input.value else None,
+                    mode=mode_select.value,
+                    questions_per_chunk=int(questions_input.value),
+                    chunk_max_chars=int(chunk_chars_input.value),
+                    output_mode=output_mode,
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                ui.notify(str(exc), color="negative", icon="error")
+                return
+            finally:
+                run_button.props(remove="loading")
+
+            destination = summary.get("output_path") or summary.get("index_name")
+            with result_card:
+                with ui.card().classes("w-full shadow-sm rounded-lg border-l-4 border-primary p-5"):
+                    with ui.row().classes("items-center gap-2 mb-3"):
+                        ui.icon("check_circle").classes("text-positive text-xl")
+                        ui.label("Run complete").classes("text-base font-semibold text-gray-800")
+
+                    with ui.row().classes("w-full gap-6"):
+                        with ui.column().classes("items-center"):
+                            ui.label(str(summary["files_processed"])).classes("text-2xl font-bold text-primary")
+                            ui.label("Processed").classes("text-xs text-gray-500")
+                        with ui.column().classes("items-center"):
+                            ui.label(str(summary["files_skipped"])).classes("text-2xl font-bold text-gray-400")
+                            ui.label("Skipped").classes("text-xs text-gray-500")
+                        with ui.column().classes("items-center"):
+                            ui.label(str(summary["total_questions"])).classes("text-2xl font-bold text-secondary")
+                            ui.label("Questions").classes("text-xs text-gray-500")
+
+                    ui.separator().classes("my-3")
+
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("storage").classes("text-gray-400 text-sm")
+                        ui.label(f"Sink: {summary['sink']}").classes("text-sm text-gray-600")
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("description").classes("text-gray-400 text-sm")
+                        ui.label(f"Destination: {destination}").classes("text-sm text-gray-600 break-all")
+
+                    if summary["sink"] == "csv" and destination and Path(destination).exists():
+                        with ui.row().classes("w-full justify-end mt-3"):
+                            ui.button(
+                                "Download CSV", icon="download", on_click=lambda: ui.download(destination)
+                            ).props("outline color=primary")
+
+
+def main() -> None:
+    LOGGER.info("Doc Q&A Ingestion UI starting on port %d...", _UI_PORT)
+    LOGGER.info("Backend target: %s", settings.llm.base_url)
+
+    for attempt in range(1, 4):
+        if _check_backend():
+            LOGGER.info("Backend health-check: OK")
+            break
+        LOGGER.info("Waiting for backend... (attempt %d/3)", attempt)
+        time.sleep(3)
+    else:
+        LOGGER.warning("Backend not responding, UI will start anyway.")
+
+    print("CDSW_APP_PORT =", os.getenv("CDSW_APP_PORT"))
+    print("CDSW_READONLY_PORT =", os.getenv("CDSW_READONLY_PORT"))
+    print("CB_APP_PORT =", os.getenv("CB_APP_PORT"))
+    print("UI_PORT =", _UI_PORT)
+    print("CDSW_PUBLIC_PORT =", os.getenv("CDSW_PUBLIC_PORT"))
+    print(f"  Doc Q&A Ingestion UI  ->  http://127.0.0.1:{_UI_PORT}")
+    print(f"  Backend target        ->  {settings.llm.base_url}")
+    print("  Press Ctrl+C to stop.\n")
+    LOGGER.info("UI ready at http://127.0.0.1:%d", _UI_PORT)
+
+    ui.run(title="Doc Q&A Ingestion", port=_UI_PORT, reload=False)
+
+
+if __name__ in {"__main__", "__mp_main__"}:
+    main()
+
+
+
+####################################################################################################
+FILE: src\genai\ingestion\__init__.py
+####################################################################################################
+
+
+
+
+####################################################################################################
+FILE: src\genai\ingestion\extractors.py
+####################################################################################################
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from docx import Document
+from openpyxl import load_workbook
+from pypdf import PdfReader
+
+from ...config import settings
+from .generator import classify_table_headers
+
+DEFAULT_CHUNK_MAX_CHARS = settings.chunking.chunk_max_chars
+
+HEADING_STYLES = {"heading 1", "heading 2", "heading 3", "title"}
+
+QUESTION_HEADERS = {"question", "questions", "question(s)", "query"}
+ANSWER_HEADERS = {"answer", "answers", "response", "responses", "solution", "solutions"}
+CATEGORY_HEADERS = {"category"}
+SUBCATEGORY_HEADERS = {"sub category", "subcategory"}
+SERIAL_HEADERS = {"serial no", "serial number", "serial", "sno", "s no", "sl no", "srno", "sr no", "sr", "#"}
+
+
+@dataclass
+class Chunk:
+    section: str
+    text: str
+
+
+@dataclass
+class TableQA:
+    question: str
+    answer: str
+    category: str = ""
+    sub_category: str = ""
+    serial_no: str = ""
+
+
+@dataclass
+class Extraction:
+    chunks: list[Chunk] = field(default_factory=list)
+    table_qa: list[TableQA] = field(default_factory=list)
+
+
+def _normalize_header(text: str) -> str:
+    return re.sub(r"[\s_.\-]+", " ", text.strip().lower()).strip()
+
+
+def _find_col(header: list[str], names: set[str]) -> int | None:
+    for i, cell in enumerate(header):
+        if _normalize_header(cell) in names:
+            return i
+    return None
+
+
+def _parse_qa_table(header: list[str], rows: list[list[str]], chat_model=None) -> list[TableQA] | None:
+    """If header looks like a Question/Answer table, extract rows directly; else None."""
+    q_idx = _find_col(header, QUESTION_HEADERS)
+    a_idx = _find_col(header, ANSWER_HEADERS)
+    cat_idx = _find_col(header, CATEGORY_HEADERS)
+    sub_idx = _find_col(header, SUBCATEGORY_HEADERS)
+    ser_idx = _find_col(header, SERIAL_HEADERS)
+
+    if (q_idx is None or a_idx is None) and chat_model is not None:
+        try:
+            mapped = classify_table_headers(chat_model, header)
+        except ValueError:
+            mapped = {}
+        q_idx = q_idx if q_idx is not None else mapped.get("question_col")
+        a_idx = a_idx if a_idx is not None else mapped.get("answer_col")
+        cat_idx = cat_idx if cat_idx is not None else mapped.get("category_col")
+        sub_idx = sub_idx if sub_idx is not None else mapped.get("sub_category_col")
+        ser_idx = ser_idx if ser_idx is not None else mapped.get("serial_col")
+
+    if q_idx is None or a_idx is None:
+        return None
+
+    qa_rows = []
+    for row in rows:
+        question = row[q_idx].strip() if q_idx < len(row) else ""
+        answer = row[a_idx].strip() if a_idx < len(row) else ""
+        if not question or not answer:
+            continue
+        category = row[cat_idx].strip() if cat_idx is not None and cat_idx < len(row) else ""
+        sub_category = row[sub_idx].strip() if sub_idx is not None and sub_idx < len(row) else ""
+        serial_no = row[ser_idx].strip() if ser_idx is not None and ser_idx < len(row) else ""
+        qa_rows.append(
+            TableQA(
+                question=question,
+                answer=answer,
+                category=category,
+                sub_category=sub_category,
+                serial_no=serial_no,
+            )
+        )
+
+    return qa_rows or None
+
+
+def extract_docx(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS, chat_model=None) -> Extraction:
+    doc = Document(str(path))
+    result = Extraction()
+    section = "Document"
+    buffer: list[str] = []
+
+    def flush():
+        text = "\n".join(buffer).strip()
+        if text:
+            result.chunks.append(Chunk(section=section, text=text))
+        buffer.clear()
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        style = (para.style.name or "").lower() if para.style else ""
+        if style in HEADING_STYLES:
+            flush()
+            section = text
+            continue
+        buffer.append(text)
+        if sum(len(b) for b in buffer) > chunk_max_chars:
+            flush()
+
+    flush()
+
+    for table in doc.tables:
+        table_rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        if not table_rows:
+            continue
+
+        header, data_rows = table_rows[0], table_rows[1:]
+        qa_rows = _parse_qa_table(header, data_rows, chat_model) if data_rows else None
+        if qa_rows:
+            result.table_qa.extend(qa_rows)
+            continue
+
+        table_text = "\n".join(" | ".join(r) for r in table_rows).strip()
+        if table_text:
+            result.chunks.append(Chunk(section=f"{section} (table)", text=table_text))
+
+    return result
+
+
+def _rows_to_text(header: list[str], rows: list[list[str]]) -> str:
+    lines = [" | ".join(header)] if header else []
+    for row in rows:
+        lines.append(" | ".join(row))
+    return "\n".join(lines).strip()
+
+
+def extract_xlsx(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS, chat_model=None) -> Extraction:
+    wb = load_workbook(str(path), data_only=True, read_only=True)
+    result = Extraction()
+
+    for sheet in wb.worksheets:
+        all_rows = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = ["" if v is None else str(v) for v in row]
+            if any(c.strip() for c in cells):
+                all_rows.append(cells)
+
+        if not all_rows:
+            continue
+
+        header, data_rows = all_rows[0], all_rows[1:]
+
+        qa_rows = _parse_qa_table(header, data_rows, chat_model) if data_rows else None
+        if qa_rows:
+            result.table_qa.extend(qa_rows)
+            continue
+
+        if not data_rows:
+            text = _rows_to_text(header, [])
+            if text:
+                result.chunks.append(Chunk(section=sheet.title, text=text))
+            continue
+
+        batch: list[list[str]] = []
+        batch_chars = 0
+        part = 1
+        for row in data_rows:
+            batch.append(row)
+            batch_chars += sum(len(c) for c in row)
+            if batch_chars > chunk_max_chars:
+                label = sheet.title if part == 1 else f"{sheet.title} (part {part})"
+                result.chunks.append(Chunk(section=label, text=_rows_to_text(header, batch)))
+                batch, batch_chars = [], 0
+                part += 1
+
+        if batch:
+            label = sheet.title if part == 1 else f"{sheet.title} (part {part})"
+            result.chunks.append(Chunk(section=label, text=_rows_to_text(header, batch)))
+
+    wb.close()
+    return result
+
+
+def extract_pdf(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS) -> Extraction:
+    reader = PdfReader(str(path))
+    result = Extraction()
+    buffer: list[str] = []
+    buffer_chars = 0
+    start_page = 1
+
+    def flush(end_page: int):
+        nonlocal buffer, buffer_chars, start_page
+        text = "\n".join(buffer).strip()
+        if text:
+            label = f"Page {start_page}" if start_page == end_page else f"Page {start_page}-{end_page}"
+            result.chunks.append(Chunk(section=label, text=text))
+        buffer, buffer_chars = [], 0
+        start_page = end_page + 1
+
+    for page_num, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
+            continue
+        buffer.append(text)
+        buffer_chars += len(text)
+        if buffer_chars > chunk_max_chars:
+            flush(page_num)
+
+    flush(len(reader.pages))
+    return result
+
+
+def extract_document(path: Path, chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS, chat_model=None) -> Extraction:
+    ext = path.suffix.lower()
+    if ext == ".docx":
+        return extract_docx(path, chunk_max_chars, chat_model)
+    if ext == ".xlsx":
+        return extract_xlsx(path, chunk_max_chars, chat_model)
+    if ext == ".pdf":
+        return extract_pdf(path, chunk_max_chars)
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+
+####################################################################################################
+FILE: src\genai\ingestion\generator.py
+####################################################################################################
+
+import json
+
+from langchain_openai import ChatOpenAI
+
+from ..prompt.loader import load_prompts
+from ..utils.llm_client import invoke_json
+
+_prompts = load_prompts()
+METADATA_PROMPT = _prompts["metadata"]
+CATEGORY_PROMPT = _prompts["category"]
+HEADER_MAP_PROMPT = _prompts["header_map"]
+QA_PROMPT = _prompts["qa"]
+
+
+def generate_doc_metadata(chat_model: ChatOpenAI, doc_text_sample: str) -> dict:
+    prompt = METADATA_PROMPT.format(text=doc_text_sample)
+    result = invoke_json(chat_model, prompt)
+    return {
+        "title": str(result.get("title", "")).strip(),
+        "keywords": [str(k).strip() for k in result.get("keywords", []) if str(k).strip()],
+        "category": str(result.get("category", "")).strip(),
+        "sub_category": str(result.get("sub_category", "")).strip(),
+    }
+
+
+def classify_qa_row(chat_model: ChatOpenAI, question: str, answer: str) -> dict:
+    prompt = CATEGORY_PROMPT.format(question=question, answer=answer)
+    result = invoke_json(chat_model, prompt)
+    return {
+        "category": str(result.get("category", "")).strip(),
+        "sub_category": str(result.get("sub_category", "")).strip(),
+    }
+
+
+def classify_table_headers(chat_model: ChatOpenAI, headers: list[str]) -> dict:
+    prompt = HEADER_MAP_PROMPT.format(headers=json.dumps(headers))
+    result = invoke_json(chat_model, prompt)
+
+    def _valid_idx(value) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if 0 <= value < len(headers) else None
+
+    return {
+        "question_col": _valid_idx(result.get("question_col")),
+        "answer_col": _valid_idx(result.get("answer_col")),
+        "category_col": _valid_idx(result.get("category_col")),
+        "sub_category_col": _valid_idx(result.get("sub_category_col")),
+        "serial_col": _valid_idx(result.get("serial_col")),
+    }
+
+
+def generate_qa_for_chunk(
+    chat_model: ChatOpenAI, section_label: str, chunk_text: str, n_questions: int
+) -> list[dict]:
+    prompt = QA_PROMPT.format(section=section_label, n=n_questions, text=chunk_text)
+    result = invoke_json(chat_model, prompt)
+    pairs = []
+    for item in result.get("qa_pairs", []):
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+        if question and answer:
+            pairs.append({"question": question, "answer": answer})
+    return pairs
+
+
+
+####################################################################################################
+FILE: src\genai\ingestion\pipeline.py
+####################################################################################################
+
+import csv
+import logging
+import uuid
+from datetime import date
+from pathlib import Path
+
+from ...config import ElasticsearchConfig, settings
+from ..utils.llm_client import get_chat_model
+from .extractors import extract_document
+from .generator import classify_qa_row, generate_doc_metadata, generate_qa_for_chunk
+
+logger = logging.getLogger("docs_ingestion")
+
+CSV_FIELDS = [
+    "Document-id",
+    "Document-type",
+    "Document-url",
+    "Ingestion-date",
+    "Title",
+    "Keywords",
+    "Category",
+    "Sub-category",
+    "Serial-no",
+    "Question",
+    "Solutions",
+]
+
+DOC_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+SUPPORTED_EXTENSIONS = {".docx", ".xlsx", ".pdf"}
+
+
+def document_id(path: Path) -> str:
+    return str(uuid.uuid5(DOC_ID_NAMESPACE, str(path.resolve())))
+
+
+def resolve_input_files(input_path: Path) -> list[Path]:
+    if input_path.is_dir():
+        files = []
+        for ext in sorted(SUPPORTED_EXTENSIONS):
+            files.extend(input_path.rglob(f"*{ext}"))
+        return sorted(files)
+
+    if input_path.is_file():
+        if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise ValueError(f"Unsupported file type: {input_path.suffix}")
+        return [input_path]
+
+    raise FileNotFoundError(f"Input path not found: {input_path}")
+
+
+def _resolve_row_category(chat_model, row, doc_category: str, doc_sub_category: str) -> tuple[str, str]:
+    category, sub_category = row.category, row.sub_category
+    if category and sub_category:
+        return category, sub_category
+
+    try:
+        classified = classify_qa_row(chat_model, row.question, row.answer)
+    except ValueError as exc:
+        logger.warning("  failed to classify table row '%s...': %s", row.question[:60], exc)
+        return category or doc_category, sub_category or doc_sub_category
+
+    return category or classified["category"] or doc_category, sub_category or classified["sub_category"] or doc_sub_category
+
+
+def process_document(
+    path: Path,
+    chat_model,
+    questions_per_chunk: int,
+    chunk_max_chars: int,
+    ingestion_date: str,
+) -> list[dict]:
+    extraction = extract_document(path, chunk_max_chars, chat_model)
+    chunks, table_qa = extraction.chunks, extraction.table_qa
+    if not chunks and not table_qa:
+        logger.info("  no extractable content, skipping")
+        return []
+
+    if chunks:
+        sample = "\n\n".join(c.text for c in chunks)[: settings.chunking.metadata_sample_chars]
+    else:
+        sample = "\n".join(f"Q: {r.question}\nA: {r.answer}" for r in table_qa)[: settings.chunking.metadata_sample_chars]
+    metadata = generate_doc_metadata(chat_model, sample)
+
+    qa_pairs: list[dict] = []
+    for chunk in chunks:
+        try:
+            generated = generate_qa_for_chunk(chat_model, chunk.section, chunk.text, questions_per_chunk)
+        except ValueError as exc:
+            logger.warning("  failed to generate questions for section '%s': %s", chunk.section, exc)
+            continue
+        for pair in generated:
+            qa_pairs.append({**pair, "category": None, "sub_category": None, "serial_no": None})
+
+    # Classified one row at a time so a single row's category never leaks into another's LLM call.
+    for row in table_qa:
+        category, sub_category = _resolve_row_category(chat_model, row, metadata["category"], metadata["sub_category"])
+        qa_pairs.append(
+            {
+                "question": row.question,
+                "answer": row.answer,
+                "category": category,
+                "sub_category": sub_category,
+                "serial_no": row.serial_no or None,
+            }
+        )
+
+    doc_id = document_id(path)
+    ext = path.suffix.lower().lstrip(".")
+    rows = []
+    for serial, pair in enumerate(qa_pairs, start=1):
+        rows.append(
+            {
+                "Document-id": doc_id,
+                "Document-type": ext,
+                "Document-url": str(path),
+                "Ingestion-date": ingestion_date,
+                "Title": metadata["title"],
+                "Keywords": "; ".join(metadata["keywords"]),
+                "Category": pair["category"] or metadata["category"],
+                "Sub-category": pair["sub_category"] or metadata["sub_category"],
+                "Serial-no": pair["serial_no"] or serial,
+                "Question": pair["question"],
+                "Solutions": pair["answer"],
+            }
+        )
+    if table_qa:
+        logger.info("  %d question(s) taken directly from table(s), %d generated", len(table_qa), len(qa_pairs) - len(table_qa))
+    return rows
+
+
+def _open_output_csv(output_path: Path, mode: str):
+    append = mode == "append" and output_path.exists() and output_path.stat().st_size > 0
+    if append:
+        with output_path.open("r", encoding="utf-8", newline="") as existing:
+            first_line = existing.readline().strip()
+        if first_line != ",".join(CSV_FIELDS):
+            print(f"  warning: existing header in {output_path} does not match expected columns, appending anyway")
+        handle = output_path.open("a", newline="", encoding="utf-8")
+        return handle, csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+
+    handle = output_path.open("w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    return handle, writer
+
+
+class _CsvSink:
+    def __init__(self, output_path: Path, mode: str):
+        self._handle, self._writer = _open_output_csv(output_path, mode)
+
+    def write(self, rows: list[dict]) -> None:
+        self._writer.writerows(rows)
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+class _ElasticsearchSink:
+    """Pushes rows into Elasticsearch as vector-searchable documents, one embedding per row."""
+
+    def __init__(self, es_config: ElasticsearchConfig):
+        from elasticsearch import helpers as es_helpers
+
+        from ..utils.embeddings import embed_row
+        from ..utils.es_client import build_es_client, ensure_index
+
+        self._bulk = es_helpers.bulk
+        self._embed_row = embed_row
+        self._index_name = es_config.index_name
+        self._client = build_es_client(
+            host=es_config.host,
+            api_key=es_config.api_key,
+            request_timeout=es_config.request_timeout,
+            max_retries=es_config.max_retries,
+            retry_on_timeout=es_config.retry_on_timeout,
+            verify_certs=es_config.verify_certs,
+            connections_per_node=es_config.connections_per_node,
+        )
+        fields = es_config.fields or CSV_FIELDS
+        ensure_index(self._client, self._index_name, es_config.index_mode, fields, settings.embeddings.dimension)
+
+    def write(self, rows: list[dict]) -> None:
+        actions = []
+        for row in rows:
+            doc = dict(row)
+            doc["embedding"] = self._embed_row(row["Question"], row["Solutions"])
+            actions.append({"_index": self._index_name, "_id": f"{row['Document-id']}-{row['Serial-no']}", "_source": doc})
+        self._bulk(self._client, actions)
+
+    def close(self) -> None:
+        pass
+
+
+def _open_sink(output_mode: str, output_path: Path | None, mode: str):
+    if output_mode == "csv":
+        return _CsvSink(output_path, mode)
+    return _ElasticsearchSink(settings.elasticsearch)
+
+
+def run_pipeline(
+    input_path: Path,
+    output_path: Path | None = None,
+    mode: str = "append",
+    questions_per_chunk: int | None = None,
+    chunk_max_chars: int | None = None,
+    output_mode: str | None = None,
+) -> dict:
+    if mode not in ("append", "overwrite"):
+        raise ValueError(f"Invalid mode: {mode!r} (expected 'append' or 'overwrite')")
+
+    output_mode = output_mode or ("elasticsearch" if settings.elasticsearch.enabled else "csv")
+    if output_mode not in ("csv", "elasticsearch"):
+        raise ValueError(f"Invalid output_mode: {output_mode!r} (expected 'csv' or 'elasticsearch')")
+    if output_mode == "csv" and not output_path:
+        raise ValueError("output_path is required when output_mode is 'csv'")
+
+    questions_per_chunk = questions_per_chunk or settings.chunking.questions_per_chunk
+    chunk_max_chars = chunk_max_chars or settings.chunking.chunk_max_chars
+    ingestion_date = date.today().isoformat()
+
+    def _summary(files_processed: int, files_skipped: int, total_questions: int) -> dict:
+        summary = {"files_processed": files_processed, "files_skipped": files_skipped, "total_questions": total_questions, "sink": output_mode}
+        if output_mode == "csv":
+            summary["output_path"] = str(output_path)
+        else:
+            summary["index_name"] = settings.elasticsearch.index_name
+        return summary
+
+    files = resolve_input_files(input_path)
+    if not files:
+        logger.info("No %s files found under %s", "/".join(sorted(SUPPORTED_EXTENSIONS)), input_path)
+        return _summary(0, 0, 0)
+
+    chat_model = get_chat_model()
+
+    files_processed = 0
+    files_skipped = 0
+    total_questions = 0
+
+    sink = _open_sink(output_mode, output_path, mode)
+    try:
+        for path in files:
+            logger.info("Processing %s ...", path)
+            try:
+                rows = process_document(path, chat_model, questions_per_chunk, chunk_max_chars, ingestion_date)
+            except Exception as exc:
+                logger.error("  error: %s, skipping file", exc)
+                files_skipped += 1
+                continue
+
+            if not rows:
+                files_skipped += 1
+                continue
+
+            sink.write(rows)
+            files_processed += 1
+            total_questions += len(rows)
+            logger.info("  %d questions generated", len(rows))
+    finally:
+        sink.close()
+
+    return _summary(files_processed, files_skipped, total_questions)
+
+
+
+####################################################################################################
+FILE: src\genai\prompt\__init__.py
+####################################################################################################
+
+
+
+
+####################################################################################################
+FILE: src\genai\prompt\loader.py
+####################################################################################################
+
+import tomllib
+from pathlib import Path
+
+from langchain_core.prompts import PromptTemplate
+
+_PROMPTS_PATH = Path(__file__).resolve().parent / "prompts.toml"
+
+
+def load_prompts() -> dict[str, PromptTemplate]:
+    with _PROMPTS_PATH.open("rb") as f:
+        raw = tomllib.load(f)
+    return {name: PromptTemplate.from_template(section["template"]) for name, section in raw.items()}
+
+
+
+####################################################################################################
+FILE: src\genai\prompt\prompts.toml
+####################################################################################################
+
+[metadata]
+template = """You are analyzing a business document to catalog it.
+Read the excerpt below and respond with ONLY a JSON object (no markdown fences) in this exact shape:
+{{"title": "<short descriptive title>", "keywords": ["<keyword1>", "<keyword2>", "..."], "category": "<broad category>", "sub_category": "<more specific sub-category>"}}
+
+Rules:
+- "title" should be a concise, human-readable title for the document (max ~12 words).
+- "keywords" should be 3 to 8 relevant single/short-phrase keywords.
+- "category" and "sub_category" should classify the document's subject matter (e.g. category "Finance", sub_category "Invoicing").
+
+Document excerpt:
+```
+{text}
+```
+"""
+
+[category]
+template = """You are cataloging a single question-and-answer pair taken from a document.
+Respond with ONLY a JSON object (no markdown fences) in this exact shape:
+{{"category": "<broad category>", "sub_category": "<more specific sub-category>"}}
+
+Question: {question}
+Answer: {answer}
+"""
+
+[header_map]
+template = """You are analyzing the header row of a table extracted from a document, to figure out which column (if any) holds which kind of data.
+Header columns (0-indexed): {headers}
+
+Respond with ONLY a JSON object (no markdown fences) in this exact shape, using the 0-indexed column position or null if that kind of column is not present:
+{{"question_col": <int|null>, "answer_col": <int|null>, "category_col": <int|null>, "sub_category_col": <int|null>, "serial_col": <int|null>}}
+
+Rules:
+- "question_col" is the column holding quiz/exam questions.
+- "answer_col" is the column holding the answer/response/solution to that question.
+- "category_col" / "sub_category_col" classify the subject matter of the row.
+- "serial_col" is a row serial/sequence number (e.g. "Sr. No", "S.No", "#").
+- Only set a field if you are confident that kind of column is actually present; otherwise use null.
+"""
+
+[qa]
+template = """You are an expert quiz writer creating study questions strictly from the provided document section.
+Section title: {section}
+
+Generate exactly {n} question-and-answer pairs grounded ONLY in the text below. Do not invent facts not present in the text.
+Respond with ONLY a JSON object (no markdown fences) in this exact shape:
+{{"qa_pairs": [{{"question": "<question text>", "answer": "<answer text>"}}, ...]}}
+
+Text:
+```
+{text}
+```
+"""
+
+
+
+####################################################################################################
+FILE: src\genai\utils\__init__.py
+####################################################################################################
+
+
+
+
+####################################################################################################
+FILE: src\genai\utils\embeddings.py
+####################################################################################################
+
+from functools import lru_cache
+
+from sentence_transformers import SentenceTransformer
+
+from ...config import settings
+
+
+@lru_cache(maxsize=1)
+def get_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(settings.embeddings.model_name, device=settings.embeddings.device)
+
+
+def embed_row(question: str, answer: str) -> list[float]:
+    model = get_embedding_model()
+    vector = model.encode(f"{question}\n{answer}")
+    return vector.tolist()
+
+
+
+####################################################################################################
+FILE: src\genai\utils\es_client.py
+####################################################################################################
+
+"""
+Elasticsearch client factory for the docs-ingestion pipeline.
+
+This module is responsible for creating, configuring, and verifying
+the Elasticsearch client used to push generated Q&A rows into a
+vector-searchable index. All connection settings are sourced from
+config.toml (or environment overrides), never hardcoded, so secrets
+stay out of source control.
+"""
+
+import logging
+
+from elasticsearch import Elasticsearch, ConnectionError as ESConnectionError, TransportError
+
+from .exceptions import ElasticsearchConnectionError, RagConfigurationError
+
+LOGGER = logging.getLogger("docs_ingestion")
+
+KEYWORD_FIELDS = {"Document-id", "Document-type", "Category", "Sub-category", "Serial-no"}
+
+
+def build_es_client(
+    host: str,
+    api_key: str,
+    request_timeout: int = 30,
+    max_retries: int = 3,
+    retry_on_timeout: bool = True,
+    verify_certs: bool = True,
+    connections_per_node: int = 10,
+) -> Elasticsearch:
+    """Create a configured Elasticsearch client instance.
+
+    Parameters
+    ----------
+    host : str
+        Elasticsearch cluster URL including scheme and port, e.g. ``"https://host:9201"``.
+    api_key : str
+        API key for authenticating with Elasticsearch. Never logged or printed.
+    request_timeout : int, optional
+        Per-request socket timeout in seconds. Default is 30.
+    max_retries : int, optional
+        Number of automatic retries on transient failures. Default is 3.
+    retry_on_timeout : bool, optional
+        Whether to retry the request if it times out. Default is True.
+    verify_certs : bool, optional
+        Whether to verify the TLS certificate. Default is True.
+    connections_per_node : int, optional
+        Size of the connection pool per Elasticsearch node. Default is 10.
+
+    Returns
+    -------
+    Elasticsearch
+        Ready-to-use Elasticsearch client instance.
+
+    Raises
+    ------
+    RagConfigurationError
+        Raised when ``host`` or ``api_key`` is empty or ``None``.
+    ElasticsearchConnectionError
+        Raised when the cluster health check fails after client creation.
+    """
+    if not host:
+        raise RagConfigurationError(
+            "Elasticsearch 'host' must not be empty. "
+            "Set 'elasticsearch.host' in config.toml or 'ELASTICSEARCH__HOST' in the environment."
+        )
+    if not api_key:
+        raise RagConfigurationError(
+            "Elasticsearch 'api_key' must not be empty. "
+            "Set 'elasticsearch.api_key' in config.toml or 'ELASTICSEARCH__API_KEY' in the environment."
+        )
+
+    LOGGER.info("Creating Elasticsearch client for host: %s", host)
+
+    client = Elasticsearch(
+        host,
+        api_key=api_key,
+        request_timeout=request_timeout,
+        max_retries=max_retries,
+        retry_on_timeout=retry_on_timeout,
+        verify_certs=verify_certs,
+        connections_per_node=connections_per_node,
+    )
+
+    _verify_connection(client, host)
+    return client
+
+
+def _verify_connection(client: Elasticsearch, host: str) -> None:
+    """Verify the Elasticsearch connection by calling cluster info.
+
+    Raises
+    ------
+    ElasticsearchConnectionError
+        Raised when ``client.info()`` raises a connection or transport error.
+    """
+    try:
+        info = client.info()
+        cluster_name = info.get("cluster_name", "unknown")
+        version = info.get("version", {}).get("number", "unknown")
+        LOGGER.info("Elasticsearch connected, cluster: '%s', version: %s", cluster_name, version)
+    except ESConnectionError as exc:
+        raise ElasticsearchConnectionError(
+            f"Cannot connect to Elasticsearch at '{host}'. Check network connectivity and cluster health."
+        ) from exc
+    except TransportError as exc:
+        raise ElasticsearchConnectionError(
+            f"Elasticsearch at '{host}' rejected the connection. Verify that the API key is valid and not expired."
+        ) from exc
+
+
+def _build_mapping(fields: list[str], embedding_dim: int) -> dict:
+    properties = {}
+    for name in fields:
+        properties[name] = {"type": "keyword" if name in KEYWORD_FIELDS else "text"}
+    properties["embedding"] = {"type": "dense_vector", "dims": embedding_dim}
+    return {"mappings": {"properties": properties}}
+
+
+def ensure_index(client: Elasticsearch, index_name: str, index_mode: str, fields: list[str], embedding_dim: int) -> None:
+    """Create or verify the target index according to ``index_mode``.
+
+    Parameters
+    ----------
+    index_mode : str
+        ``"create"`` creates the index (with a mapping built from ``fields`` plus a
+        ``dense_vector`` "embedding" field) only if it does not already exist; it never
+        deletes or recreates an existing index. ``"append"`` requires the index to already
+        exist and raises ``RagConfigurationError`` otherwise.
+
+    Raises
+    ------
+    RagConfigurationError
+        Raised for an unrecognized ``index_mode``, or when ``index_mode == "append"`` and
+        the index does not exist.
+    """
+    if index_mode not in ("create", "append"):
+        raise RagConfigurationError(f"Invalid elasticsearch.index_mode: {index_mode!r} (expected 'create' or 'append')")
+
+    exists = client.indices.exists(index=index_name)
+
+    if index_mode == "append":
+        if not exists:
+            raise RagConfigurationError(
+                f"Elasticsearch index '{index_name}' does not exist, but index_mode is 'append'. "
+                "Either create it out-of-band first, or set elasticsearch.index_mode = \"create\" in config.toml."
+            )
+        return
+
+    if exists:
+        LOGGER.info("Elasticsearch index '%s' already exists, appending to it", index_name)
+        return
+
+    LOGGER.info("Creating Elasticsearch index '%s'", index_name)
+    client.indices.create(index=index_name, body=_build_mapping(fields, embedding_dim))
+
+
+
+####################################################################################################
+FILE: src\genai\utils\exceptions.py
+####################################################################################################
+
+class RagConfigurationError(Exception):
+    """Raised when required Elasticsearch/embedding configuration is missing or invalid."""
+
+
+class ElasticsearchConnectionError(Exception):
+    """Raised when the Elasticsearch cluster is unreachable or rejects the connection."""
+
+
+
+####################################################################################################
+FILE: src\genai\utils\llm_client.py
+####################################################################################################
+
+from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_openai import ChatOpenAI
+
+from ...config import settings
+
+_json_parser = JsonOutputParser()
+
+
+def get_chat_model() -> ChatOpenAI:
+    llm = settings.llm
+    return ChatOpenAI(
+        base_url=llm.base_url,
+        api_key=llm.api_key,
+        model=llm.model_name,
+        temperature=llm.temperature,
+        max_tokens=llm.max_tokens,
+        timeout=llm.timeout,
+    )
+
+
+def invoke_json(chat_model: ChatOpenAI, prompt: str, retries: int = 2) -> dict:
+    chain = chat_model | _json_parser
+    messages = [{"role": "user", "content": prompt}]
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            return chain.invoke(messages)
+        except OutputParserException as exc:
+            last_error = exc
+            messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": exc.llm_output or ""},
+                {
+                    "role": "user",
+                    "content": (
+                        f"That was not valid JSON ({exc}). "
+                        "Reply again with ONLY the corrected JSON object, no markdown fences, no commentary."
+                    ),
+                },
+            ]
+
+    raise ValueError(f"LLM did not return valid JSON after {retries + 1} attempts: {last_error}")
+
+
+
+####################################################################################################
+FILE: src\genai\utils\logging_config.py
+####################################################################################################
+
+import logging
+from logging.handlers import RotatingFileHandler
+
+from ...config import PROJECT_ROOT, LoggingConfig
+
+LOGGER_NAME = "docs_ingestion"
+
+
+def setup_logging(config: LoggingConfig) -> logging.Logger:
+    """Attach a rotating file handler (under the repo's `logs/` folder) and a console
+    handler to the shared "docs_ingestion" logger. Safe to call more than once."""
+    logger = logging.getLogger(LOGGER_NAME)
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(config.level)
+
+    log_dir = PROJECT_ROOT / config.dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    file_handler = RotatingFileHandler(
+        log_dir / config.filename,
+        maxBytes=config.max_bytes,
+        backupCount=config.backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
