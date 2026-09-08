@@ -1,5 +1,255 @@
 # Docs Ingestion
 
+## Architecture
+
+The Docs Ingestion Pipeline provides three ways to trigger the same core ingestion workflow:
+
+* **CLI** — command-line document processing
+* **FastAPI** — backend API
+* **NiceGUI** — interactive web UI
+
+All entry points share the same pipeline and document-processing components.
+
+### High-Level Architecture
+
+```mermaid
+flowchart TB
+    U[User / Client]
+
+    subgraph ENTRY["Entry Points"]
+        CLI[CLI<br/>main.py]
+        API[FastAPI Backend<br/>api.py]
+        UI[NiceGUI Web UI<br/>application/app.py]
+        NB[Interactive Notebook]
+    end
+
+    subgraph PIPE["Core Pipeline"]
+        P[pipeline.py<br/>Orchestration]
+        E[extractors.py<br/>Document Extraction & Chunking]
+        G[generator.py<br/>LLM Generation / Classification]
+    end
+
+    subgraph INPUT["Input Documents"]
+        DOCX[.docx]
+        XLSX[.xlsx]
+        PDF[.pdf]
+    end
+
+    subgraph AI["AI / NLP Layer"]
+        LC[LangChain]
+        LLM[OpenAI-compatible LLM<br/>vLLM]
+        ST[Sentence Transformers<br/>Local Embedding Model]
+    end
+
+    subgraph PROMPT["Prompt Management"]
+        PT[prompts.toml]
+        PL[loader.py<br/>PromptTemplate Loader]
+    end
+
+    subgraph OUTPUT["Output Sinks"]
+        CSV[CSV File<br/>questions.csv]
+        ES[Elasticsearch<br/>Vector Search Index]
+    end
+
+    subgraph UTIL["Utilities"]
+        CFG[config.py<br/>Pydantic Settings]
+        LOG[logging_config.py<br/>Rotating Logs]
+        LCli[llm_client.py]
+        EMB[embeddings.py]
+        ESC[es_client.py]
+    end
+
+    U --> CLI
+    U --> API
+    U --> UI
+    NB --> API
+
+    CLI --> P
+    API --> P
+    UI --> P
+
+    DOCX --> E
+    XLSX --> E
+    PDF --> E
+
+    P --> E
+    E --> G
+
+    PT --> PL
+    PL --> G
+
+    G --> LC
+    LC --> LLM
+
+    G --> CSV
+    G --> ST
+    ST --> EMB
+    EMB --> ES
+
+    P --> CFG
+    G --> LCli
+    ES --> ESC
+
+    CLI --> LOG
+    API --> LOG
+    UI --> LOG
+```
+
+### Document Ingestion Flow
+
+The extractor handles documents differently depending on whether they contain
+an existing Q&A table.
+
+```mermaid
+flowchart TD
+    START([Start Ingestion]) --> SOURCE{Input Source}
+
+    SOURCE -->|Folder| SCAN[Recursively scan folder]
+    SOURCE -->|Single file| FILE[Validate file]
+    SCAN --> FILE
+
+    FILE --> TYPE{File Type}
+
+    TYPE -->|DOCX| DX[Extract DOCX]
+    TYPE -->|XLSX| XX[Extract XLSX]
+    TYPE -->|PDF| PX[Extract PDF]
+
+    DX --> TABLECHECK{Existing Q&A Table?}
+    XX --> TABLECHECK
+    PX --> PDFTEXT[Extract PDF text<br/>grouped by page span]
+
+    TABLECHECK -->|Yes| QATABLE[Extract Q&A rows]
+    TABLECHECK -->|No| FREETEXT[Extract free-text sections]
+
+    QATABLE --> HEADERS{Recognized<br/>Question + Answer headers?}
+
+    HEADERS -->|Yes| ROWS[Process Q&A rows]
+    HEADERS -->|No| HEADERMAP[LLM Header Mapping]
+
+    HEADERMAP --> MAPOK{Mapping successful?}
+    MAPOK -->|Yes| ROWS
+    MAPOK -->|No| FREETEXT
+
+    ROWS --> META{Category /<br/>Sub-category present?}
+
+    META -->|Yes| DIRECTMETA[Use table metadata]
+    META -->|No| CLASSIFY[LLM Classification<br/>One call per row]
+
+    DIRECTMETA --> SERIAL{Serial No present?}
+    CLASSIFY --> SERIAL
+
+    SERIAL -->|Yes| KEEP[Keep source Serial No]
+    SERIAL -->|No| AUTO[Generate Serial No]
+
+    KEEP --> RECORD[Create Q&A Record]
+    AUTO --> RECORD
+
+    FREETEXT --> CHUNK[Chunk Content]
+    PDFTEXT --> CHUNK
+
+    CHUNK --> CHUNKTYPE{Chunk Strategy}
+
+    CHUNKTYPE -->|DOCX| HEADING[Chunk by Heading]
+    CHUNKTYPE -->|XLSX| ROWBATCH[Sheet / Row Batch]
+    CHUNKTYPE -->|PDF| PAGE[Page Span]
+
+    HEADING --> LLMQA[LLM Q&A Generation]
+    ROWBATCH --> LLMQA
+    PAGE --> LLMQA
+
+    LLMQA --> JSON{Valid JSON?}
+
+    JSON -->|No| CORRECT[Correction Message]
+    CORRECT --> LLMQA
+
+    JSON -->|Yes| RECORD
+
+    RECORD --> OUTPUT{Output Mode}
+
+    OUTPUT -->|CSV| CSV[Write CSV]
+    OUTPUT -->|Elasticsearch| EMBED[Generate Embedding]
+
+    EMBED --> MODEL[Sentence Transformers<br/>384-dimensional Vector]
+    MODEL --> ES[Elasticsearch<br/>Vector Search Index]
+
+    CSV --> END([Complete])
+    ES --> END
+```
+
+### LLM Processing
+
+The LLM is used for metadata inference, classification, header mapping, and
+Q&A generation. Prompts are externalized in `prompts.toml` so they can be
+modified without changing Python code.
+
+```mermaid
+flowchart LR
+    G[generator.py]
+
+    G --> M[Metadata]
+    G --> C[Category]
+    G --> H[Header Mapping]
+    G --> Q[Q&A Generation]
+
+    M --> PT[prompts.toml]
+    C --> PT
+    H --> PT
+    Q --> PT
+
+    PT --> L[loader.py]
+    L --> T[LangChain PromptTemplate]
+
+    T --> LC[LangChain]
+    LC --> CLIENT[llm_client.py]
+    CLIENT --> VLLM[OpenAI-compatible<br/>vLLM Server]
+
+    VLLM --> RESP[LLM Response]
+    RESP --> PARSER[JsonOutputParser]
+
+    PARSER --> VALID{Valid JSON?}
+
+    VALID -->|Yes| RESULT[Structured Result]
+    VALID -->|No| FIX[Correction Prompt]
+    FIX --> LC
+```
+
+### Output Flow
+
+```mermaid
+flowchart LR
+    RECORD[Generated Q&A Record]
+
+    RECORD --> MODE{Output Mode}
+
+    MODE -->|CSV| CSV[questions.csv]
+
+    MODE -->|Elasticsearch| EMB[Sentence Transformers]
+    EMB --> VECTOR[384-dimension Embedding]
+    VECTOR --> ES[Elasticsearch<br/>docs-qa Index]
+
+    ES --> SEARCH[Vector Search]
+```
+
+### Component Responsibilities
+
+| Component                 | Responsibility                                              |
+| ------------------------- | ----------------------------------------------------------- |
+| `main.py`                 | CLI entry point                                             |
+| `api.py`                  | FastAPI backend                                             |
+| `application/app.py`      | NiceGUI web interface                                       |
+| `application/launcher.py` | Starts API + UI together                                    |
+| `pipeline.py`             | Shared ingestion orchestration                              |
+| `extractors.py`           | DOCX/XLSX/PDF extraction, chunking, and Q&A-table detection |
+| `generator.py`            | LLM metadata, classification, and Q&A generation            |
+| `prompt/prompts.toml`     | Externalized LLM prompts                                    |
+| `prompt/loader.py`        | Loads prompts into LangChain `PromptTemplate` objects       |
+| `utils/llm_client.py`     | LLM client and strict JSON invocation                       |
+| `utils/embeddings.py`     | Local sentence-transformers embeddings                      |
+| `utils/es_client.py`      | Elasticsearch client and index management                   |
+| `config.py`               | Pydantic configuration and environment overrides            |
+| `logging_config.py`       | Console + rotating file logging                             |
+
+
 Agentic pipeline that scans `.docx` / `.xlsx` / `.pdf` documents and produces
 quiz-style Question/Answer data, either as a CSV file or pushed into
 Elasticsearch as vector-searchable documents. An OpenAI-compatible LLM (served
